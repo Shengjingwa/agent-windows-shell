@@ -1,0 +1,30 @@
+---
+description: Route Windows agent commands to PowerShell, Git Bash, cmd, or explicit WSL
+alwaysApply: true
+---
+
+# Windows shells (any agent)
+
+PowerShell 7 is the stable host, not the only usable shell. Choose by command semantics:
+
+- PowerShell for Windows administration, filesystem work, and mixed native CLI workflows.
+- Git Bash for scripts that genuinely use Bash grammar such as `export`, `source`, heredoc, or `[[ ... ]]`.
+- `cmd.exe /d /c` for existing `.cmd` / `.bat` syntax and Windows commands that require `cmd`.
+- WSL only when a Linux distribution or Linux-resident project/toolchain is required; invoke it explicitly with `wsl.exe`.
+
+Do not move ordinary `git`, `npm`, Python, compiler, or HTTP commands to another shell merely because that shell can run them. If a rewrite hook is installed, it may route clear Bash or batch syntax, but it never auto-routes destructive commands.
+
+## Commands
+
+- In PowerShell, use `;` only for unconditional sequencing. Gate dependent commands with `$LASTEXITCODE` or `$?`; `&&` / `||` require PowerShell 7.
+- Multi-line commit: write a file, then `git commit --file`. Not heredoc, not `@'...'@` inside bash.
+- `ls` / `rm` / `curl` may be aliases on 5.1. Prefer `Get-ChildItem`, `Remove-Item -Recurse -Force`, `curl.exe`.
+- Do not write Bash syntax inside a PowerShell command. Route the complete Bash script explicitly when Bash is the right interpreter.
+- Before recursive delete or move, resolve and verify the target in the same shell that performs the operation.
+
+## Encoding and exit codes
+
+- Non-ASCII output: set `[Console]::OutputEncoding` and `$OutputEncoding` to UTF-8 first. `-NoProfile` skips the user's profile.
+- Write files with the editor tool or `[IO.File]::WriteAllText`. `Set-Content -Encoding UTF8` on 5.1 adds a BOM.
+- After native programs, read `$LASTEXITCODE`. Do not `2>&1 | ...` then trust the pipeline exit code.
+- `NO_PROXY` is ignored by Windows PowerShell 5.1 `Invoke-RestMethod`. Use `curl.exe --noproxy '*'` or `-NoProxy` (PowerShell 6+).

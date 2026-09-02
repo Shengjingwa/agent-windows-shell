@@ -1,0 +1,13 @@
+{
+  "gitBash": null,
+  "powerShell7": null,
+  "commandPrompt": null,
+  "internalHostPatterns": [],
+  "useNoProxyEnv": true,
+  "utf8Prefix": true,
+  "wrapHeredoc": true,
+  "wrapAndAnd": true,
+  "autoRouteBash": true,
+  "autoRouteCmd": true,
+  "rfc1918NoProxy": true
+}
