@@ -45,7 +45,7 @@ Set-Location <这个目录>
 
 再把 `adapters\generic\AGENTS.md` 贴进那个产品的说明文件。
 
-无法接入命令前置 Hook 时，可以把路由器作为统一命令入口：
+无法接入命令前置 Hook 时，先确认 `AGENT_WINDOWS_SHELL_ROOT` 和 wrapper 文件存在，再把路由器作为统一命令入口；wrapper 不可用时直接在已选 shell 中执行命令：
 
 ```powershell
 python.exe "$env:AGENT_WINDOWS_SHELL_ROOT\src\rewrite_windows_shell.py" --explain 'export NAME=agent'

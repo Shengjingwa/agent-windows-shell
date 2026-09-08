@@ -19,10 +19,10 @@ Use PowerShell 7 as the stable host, then choose another interpreter only when t
 - Keep `git`, `npm`, Python, compilers, and similar native CLIs in the current host unless shell syntax requires otherwise
 - In PowerShell, use `;` only for unconditional sequencing; gate dependent commands with `$LASTEXITCODE` or `$?`
 - `$HOME` / `$env:USERPROFILE` for paths
-- `curl.exe --noproxy '*' --max-time 30` for HTTP; `git commit --file` for multi-line messages
+- `curl.exe --max-time 30` for HTTP while preserving the configured proxy; add `--noproxy '*'` only for an explicitly direct request or a target covered by `NO_PROXY`; use `git commit --file` for multi-line messages
 - After `git` / `npm` / compilers: check `$LASTEXITCODE`
 - If `agent-windows-shell` is installed, let its hook route only clear Bash or batch syntax
-- Without a pre-tool hook, use `rewrite_windows_shell.py --run '<command>'`; inspect routing with `--explain '<command>'`
+- Without a pre-tool hook, use `rewrite_windows_shell.py --run '<command>'` only after resolving and verifying that script path; if it is unavailable, run the command directly in the selected host. Inspect routing with `--explain '<command>'` when the wrapper is available
 - Explicitly select `bash`, `cmd`, or `wsl.exe` when ambiguity remains
 
 ## Do not
