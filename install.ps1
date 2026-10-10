@@ -239,7 +239,13 @@ Write-Host "pwsh    $(if ($pwsh) { $pwsh } else { '(not found)' })"
 Write-Host "gitbash $(if ($gitBash) { $gitBash } else { '(not found)' })"
 Write-Host "cmd     $(if ($commandPrompt) { $commandPrompt } else { '(not found)' })"
 
-$userProfile = Join-Path $env:USERPROFILE 'Documents\PowerShell\Microsoft.PowerShell_profile.ps1'
+# pwsh finds $PROFILE under the Documents known folder, which OneDrive or a
+# policy may move. A redirected USERPROFILE (a test sandbox) keeps its own.
+$documents = [Environment]::GetFolderPath('MyDocuments')
+if (-not $documents -or $env:USERPROFILE -ne [Environment]::GetFolderPath('UserProfile')) {
+    $documents = Join-Path $env:USERPROFILE 'Documents'
+}
+$userProfile = Join-Path $documents 'PowerShell\Microsoft.PowerShell_profile.ps1'
 $profileBegin = '# >>> agent-windows-shell (managed by install.ps1; do not edit) >>>'
 $profileEnd = '# <<< agent-windows-shell <<<'
 # The first release wrote an unmarked block that read env vars and JSON. It
@@ -389,7 +395,8 @@ if ($Cursor) {
     Write-Utf8NoBom -LiteralPath $hooksPath `
         -Value ($hooks | ConvertTo-Json -Depth 20)
     Write-Host "cursor  $hooksPath"
-    if (-not $profileManaged -and $profileText -notmatch $legacyBlock -and $cfg.utf8Prefix -ne $true) {
+    # Without pwsh 7 the host is 5.1, and the hook adds the UTF-8 setup itself.
+    if ($pwsh -and -not $profileManaged -and $profileText -notmatch $legacyBlock -and $cfg.utf8Prefix -ne $true) {
         Write-Warning "No agent-windows-shell block in $userProfile, so Cursor's shells keep the console code page and non-ASCII output can garble. Run install.ps1 -Profile, or set `"utf8Prefix`": true in $homeCfg."
     }
     # Cursor ignores ~\.cursor\rules; an earlier release copied a rule file there.
@@ -464,19 +471,22 @@ if ($Claude) {
     if (-not (Test-Path $claudeDir)) { New-Item -ItemType Directory -Force -Path $claudeDir | Out-Null }
     $rewrite = Join-Path $KitRoot 'src\rewrite_windows_shell.py'
     $settingsPath = Join-Path $claudeDir 'settings.json'
-    $hookCmd = "& `"$python`" `"$rewrite`""
+    # Exec form: Claude runs shell-form hooks in Git Bash, which cannot parse `& "…"`.
+    # Its Bash tool already runs bash, so only the PowerShell tool is matched.
     $entry = @{
-        matcher = 'Bash|PowerShell|Shell'
+        matcher = 'PowerShell'
         hooks   = @(
             @{
                 type    = 'command'
-                command = $hookCmd
+                command = $python
+                args    = @($rewrite)
             }
         )
     }
     if (Test-Path $settingsPath) {
         Write-Host "claude  $settingsPath exists — merge PreToolUse manually; see adapters\claude\README.md"
-        Write-Host "        command = $hookCmd"
+        Write-Host "        command = $python"
+        Write-Host "        args    = [`"$rewrite`"]"
     } else {
         $doc = @{
             hooks = @{
