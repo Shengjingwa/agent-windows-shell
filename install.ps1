@@ -96,7 +96,7 @@ function Merge-ManagedHook {
     if ($property) {
         foreach ($item in @($property.Value)) {
             if (-not ($item.command -and
-                    [string]$item.command -like "*$ScriptPath*")) {
+                    ([string]$item.command).IndexOf($ScriptPath, [StringComparison]::OrdinalIgnoreCase) -ge 0)) {
                 [void]$merged.Add($item)
             }
         }
@@ -108,7 +108,24 @@ function Merge-ManagedHook {
 function Remove-Link {
     # Deletes a junction or symlink without touching its target.
     param([Parameter(Mandatory = $true)][string]$LiteralPath)
-    [IO.Directory]::Delete($LiteralPath)
+    if ((Get-Item -LiteralPath $LiteralPath -Force) -is [IO.DirectoryInfo]) {
+        [IO.Directory]::Delete($LiteralPath)
+    } else {
+        [IO.File]::Delete($LiteralPath)
+    }
+}
+
+function Test-PlainJson {
+    # PowerShell 7's ConvertFrom-Json accepts comments and trailing commas, and
+    # a rewrite would drop them. 5.1's parser rejects them before we get here.
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text) -or $PSVersionTable.PSVersion.Major -lt 6) { return $true }
+    try {
+        [System.Text.Json.JsonDocument]::Parse($Text).Dispose()
+        return $true
+    } catch {
+        return $false
+    }
 }
 
 function Install-SkillLink {
@@ -153,7 +170,12 @@ function Find-Python {
     }
     $launcher = Get-Command py.exe -ErrorAction SilentlyContinue
     if ($launcher -and $launcher.Source) {
-        $resolved = & $launcher.Source -3 -c 'import sys; print(sys.executable)' 2>$null
+        # Under 5.1 with ErrorActionPreference Stop, any stderr line from py throws.
+        try {
+            $resolved = & $launcher.Source -3 -c 'import sys; print(sys.executable)' 2>$null
+        } catch {
+            $resolved = $null
+        }
         if ($LASTEXITCODE -eq 0 -and $resolved -and (Test-Path -LiteralPath $resolved)) {
             return [string]$resolved
         }
@@ -217,6 +239,26 @@ Write-Host "pwsh    $(if ($pwsh) { $pwsh } else { '(not found)' })"
 Write-Host "gitbash $(if ($gitBash) { $gitBash } else { '(not found)' })"
 Write-Host "cmd     $(if ($commandPrompt) { $commandPrompt } else { '(not found)' })"
 
+$userProfile = Join-Path $env:USERPROFILE 'Documents\PowerShell\Microsoft.PowerShell_profile.ps1'
+$profileBegin = '# >>> agent-windows-shell (managed by install.ps1; do not edit) >>>'
+$profileEnd = '# <<< agent-windows-shell <<<'
+# The first release wrote an unmarked block that read env vars and JSON. It
+# ends with the unindented `}` that closes `if ($root) {`.
+$legacyBlock = '(?ms)^# agent-windows-shell \(do not edit; managed by install\.ps1\)\r?\n' +
+    '.*?^if \(\$root\) \{.*?^\}(?=[ \t]*\r?$)'
+$profileText = ''
+$profileReadable = $true
+if (Test-Path -LiteralPath $userProfile) {
+    try {
+        # Strict: a profile saved in a legacy code page must not be rewritten as UTF-8.
+        $profileText = [IO.File]::ReadAllText($userProfile, [Text.UTF8Encoding]::new($false, $true))
+    } catch {
+        $profileReadable = $false
+    }
+}
+# Settings the managed profile block replaces stay in the config until that block exists.
+$profileManaged = ($Profile -and $profileReadable) -or $profileText.Contains($profileBegin)
+
 $homeCfg = Join-Path $env:USERPROFILE '.agent-windows-shell.json'
 $cfg = Read-JsonObject -LiteralPath $homeCfg
 # The config holds machine facts and the user's own overrides. Behaviour flags
@@ -230,7 +272,8 @@ foreach ($name in $detected.Keys) {
     Set-ObjectProperty -Object $cfg -Name $name -Value $detected[$name]
 }
 # Older installers copied every default into this file. Drop those copies
-# (and the unused kitRoot) so they stop pinning old behaviour.
+# (and kitRoot, which only the first release's profile block read) so they
+# stop pinning old behaviour.
 $legacyDefaults = [ordered]@{
     useNoProxyEnv  = $true
     utf8Prefix     = $true
@@ -242,6 +285,7 @@ $legacyDefaults = [ordered]@{
 }
 $removed = @()
 foreach ($name in $legacyDefaults.Keys) {
+    if ($name -eq 'utf8Prefix' -and -not $profileManaged) { continue }
     $property = $cfg.PSObject.Properties[$name]
     if ($property -and $property.Value -eq $legacyDefaults[$name]) {
         $cfg.PSObject.Properties.Remove($name)
@@ -253,7 +297,7 @@ if ($patterns -and @($patterns.Value).Count -eq 0) {
     $cfg.PSObject.Properties.Remove('internalHostPatterns')
     $removed += 'internalHostPatterns'
 }
-if ($cfg.PSObject.Properties['kitRoot']) {
+if ($profileManaged -and $cfg.PSObject.Properties['kitRoot']) {
     $cfg.PSObject.Properties.Remove('kitRoot')
     $removed += 'kitRoot'
 }
@@ -273,34 +317,24 @@ if ($Env) {
     Write-Host 'env     PYTHONUTF8, PYTHONIOENCODING, AGENT_WINDOWS_SHELL_ROOT (User)'
 }
 
-if ($Profile) {
-    $profileDir = Join-Path $env:USERPROFILE 'Documents\PowerShell'
-    if (-not (Test-Path $profileDir)) { New-Item -ItemType Directory -Force -Path $profileDir | Out-Null }
-    $userProfile = Join-Path $profileDir 'Microsoft.PowerShell_profile.ps1'
+if ($Profile -and -not $profileReadable) {
+    Write-Warning "$userProfile is not UTF-8; left unchanged. Save it as UTF-8 and run again, or add the block from README.md by hand."
+} elseif ($Profile) {
     # A literal path keeps shell start-up cheap: no env lookup, no JSON parse.
     $kitProfile = Join-Path $KitRoot 'src\profile.ps1'
     $quotedProfile = "'" + $kitProfile.Replace("'", "''") + "'"
-    $begin = '# >>> agent-windows-shell (managed by install.ps1; do not edit) >>>'
-    $end = '# <<< agent-windows-shell <<<'
     $snippet = @(
-        $begin,
+        $profileBegin,
         "if ([IO.File]::Exists($quotedProfile)) { . $quotedProfile }",
-        $end
+        $profileEnd
     ) -join "`r`n"
-    $existing = ''
-    if (Test-Path -LiteralPath $userProfile) {
-        $existing = Get-Content -LiteralPath $userProfile -Raw -Encoding UTF8
-        if ($null -eq $existing) { $existing = '' }
-    }
-    $managed = '(?s)' + [regex]::Escape($begin) + '.*?' + [regex]::Escape($end)
-    # The first release wrote an unmarked block that read env vars and JSON.
-    $legacy = '(?s)# agent-windows-shell \(do not edit; managed by install\.ps1\)\r?\n' +
-        '\$root = .*?if \(\$root\) \{\r?\n[^\r\n]*\r?\n[^\r\n]*\r?\n\}'
+    $existing = $profileText
+    $managed = '(?s)' + [regex]::Escape($profileBegin) + '.*?' + [regex]::Escape($profileEnd)
     if ($existing -match $managed) {
         $updated = [regex]::Replace($existing, $managed, { param($m) $snippet })
         $state = 'refreshed'
-    } elseif ($existing -match $legacy) {
-        $updated = [regex]::Replace($existing, $legacy, { param($m) $snippet })
+    } elseif ($existing -match $legacyBlock) {
+        $updated = [regex]::Replace($existing, $legacyBlock, { param($m) $snippet })
         $state = 'upgraded from the first release'
     } elseif ([string]::IsNullOrWhiteSpace($existing)) {
         $updated = $snippet + "`r`n"
@@ -309,7 +343,7 @@ if ($Profile) {
         $updated = $existing.TrimEnd() + "`r`n`r`n" + $snippet + "`r`n"
         $state = 'appended'
     }
-    if ($updated -ne $existing) {
+    if ($updated -cne $existing) {
         Write-Utf8NoBom -LiteralPath $userProfile -Value $updated
     } else {
         $state = 'unchanged'
@@ -355,6 +389,9 @@ if ($Cursor) {
     Write-Utf8NoBom -LiteralPath $hooksPath `
         -Value ($hooks | ConvertTo-Json -Depth 20)
     Write-Host "cursor  $hooksPath"
+    if (-not $profileManaged -and $profileText -notmatch $legacyBlock -and $cfg.utf8Prefix -ne $true) {
+        Write-Warning "No agent-windows-shell block in $userProfile, so Cursor's shells keep the console code page and non-ASCII output can garble. Run install.ps1 -Profile, or set `"utf8Prefix`": true in $homeCfg."
+    }
     # Cursor ignores ~\.cursor\rules; an earlier release copied a rule file there.
     $staleRule = Join-Path $cursorDir 'rules\windows-powershell-agent.mdc'
     if (Test-Path -LiteralPath $staleRule) {
@@ -379,8 +416,10 @@ if ($Cursor) {
         }
         $settingsExist = Test-Path $settingsPath
         $cur = $null
+        $plainSettings = $true
         if ($settingsExist) {
             try { $cur = Read-JsonObject -LiteralPath $settingsPath } catch { $cur = $null }
+            $plainSettings = Test-PlainJson (Get-Content -LiteralPath $settingsPath -Raw -Encoding UTF8)
         }
         if ($settingsExist -and $null -eq $cur) {
             Write-Warning "$settingsPath is not plain JSON; left unchanged. Add adapters\cursor\settings.snippet.json by hand."
@@ -404,7 +443,7 @@ if ($Cursor) {
                 } | Sort-Object)
             if ($pending.Count -eq 0) {
                 Write-Host "cursor  $settingsPath (unchanged)"
-            } elseif ((Get-Content -LiteralPath $settingsPath -Raw -Encoding UTF8) -match '(?m)^\s*(//|/\*)') {
+            } elseif (-not $plainSettings) {
                 Write-Warning "$settingsPath has comments that a rewrite would drop; left unchanged. Add these keys by hand: $($pending -join ', ') (see adapters\cursor\settings.snippet.json)"
             } else {
                 foreach ($k in $pending) { $map[$k] = $overlay[$k] }
