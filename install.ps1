@@ -51,6 +51,30 @@ function Read-JsonObject {
     return $raw | ConvertFrom-Json
 }
 
+function Get-CanonicalJson {
+    # JSON text with sorted keys, so two parsed values compare equal whatever
+    # their key order or container type (hashtable or parsed object).
+    param($Value)
+    if ($null -eq $Value) { return 'null' }
+    $isTable = $Value -is [System.Collections.IDictionary]
+    if ($isTable -or $Value -is [pscustomobject]) {
+        $names = if ($isTable) { @($Value.Keys) } else { @($Value.PSObject.Properties.Name) }
+        $pairs = @()
+        foreach ($name in ($names | Sort-Object)) {
+            # Assign inside if/else: output through the pipeline would unwrap a one-item array.
+            if ($isTable) { $child = $Value[$name] } else { $child = $Value.PSObject.Properties[$name].Value }
+            $pairs += '{0}:{1}' -f (ConvertTo-Json -InputObject $name -Compress), (Get-CanonicalJson $child)
+        }
+        return '{' + ($pairs -join ',') + '}'
+    }
+    if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
+        $items = @()
+        foreach ($item in $Value) { $items += Get-CanonicalJson $item }
+        return '[' + ($items -join ',') + ']'
+    }
+    return ConvertTo-Json -InputObject $Value -Compress
+}
+
 function Set-ObjectProperty {
     param(
         [Parameter(Mandatory = $true)]$Object,
@@ -81,22 +105,67 @@ function Merge-ManagedHook {
     Set-ObjectProperty -Object $Hooks -Name $Event -Value @($merged)
 }
 
-function Find-Python {
-    $cmds = @('python.exe', 'py.exe')
-    foreach ($name in $cmds) {
-        $c = Get-Command $name -ErrorAction SilentlyContinue
-        if ($c -and $c.Source) { return $c.Source }
-    }
-    $guess = @(
-        "$env:LocalAppData\Programs\Python\Python313\python.exe",
-        "$env:LocalAppData\Programs\Python\Python312\python.exe",
-        "${env:ProgramFiles}\Python313\python.exe",
-        "${env:ProgramFiles}\Python312\python.exe"
+function Remove-Link {
+    # Deletes a junction or symlink without touching its target.
+    param([Parameter(Mandatory = $true)][string]$LiteralPath)
+    [IO.Directory]::Delete($LiteralPath)
+}
+
+function Install-SkillLink {
+    # Link, never copy: a copy goes stale the next time the kit changes.
+    param(
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string]$LinkPath
     )
-    foreach ($p in $guess) {
-        if (Test-Path $p) { return $p }
+    $parent = Split-Path -Parent $LinkPath
+    if (-not (Test-Path -LiteralPath $parent)) {
+        New-Item -ItemType Directory -Force -Path $parent | Out-Null
     }
-    throw 'python.exe not found. Install Python 3 and add it to PATH.'
+    if (Test-Path -LiteralPath $LinkPath) {
+        $item = Get-Item -LiteralPath $LinkPath -Force
+        if ($item.LinkType) {
+            if (@($item.Target) -contains $Source) {
+                Write-Host "skill   $LinkPath (already linked)"
+                return
+            }
+            Remove-Link -LiteralPath $LinkPath
+        } else {
+            $others = @(Get-ChildItem -LiteralPath $LinkPath -Force |
+                    Where-Object { $_.Name -ne 'SKILL.md' })
+            if ($others.Count -gt 0) {
+                Write-Warning "$LinkPath holds files this installer did not create; left unchanged"
+                return
+            }
+            Remove-Item -LiteralPath $LinkPath -Recurse -Force
+        }
+    }
+    New-Item -ItemType Junction -Path $LinkPath -Target $Source | Out-Null
+    Write-Host "skill   $LinkPath -> $Source"
+}
+
+function Find-Python {
+    # The hook runs before every command, so point it at the interpreter itself:
+    # the py.exe launcher adds a process hop to each call.
+    $c = Get-Command python.exe -ErrorAction SilentlyContinue
+    # The WindowsApps python.exe is a Store launcher, not an interpreter.
+    if ($c -and $c.Source -and $c.Source -notmatch '\\WindowsApps\\') {
+        return $c.Source
+    }
+    $launcher = Get-Command py.exe -ErrorAction SilentlyContinue
+    if ($launcher -and $launcher.Source) {
+        $resolved = & $launcher.Source -3 -c 'import sys; print(sys.executable)' 2>$null
+        if ($LASTEXITCODE -eq 0 -and $resolved -and (Test-Path -LiteralPath $resolved)) {
+            return [string]$resolved
+        }
+    }
+    foreach ($version in '313', '312', '311') {
+        foreach ($root in "$env:LocalAppData\Programs\Python", $env:ProgramFiles) {
+            $candidate = Join-Path $root "Python$version\python.exe"
+            if (Test-Path -LiteralPath $candidate) { return $candidate }
+        }
+    }
+    if ($launcher -and $launcher.Source) { return $launcher.Source }
+    throw 'Python 3 not found. Install it from python.org, or install the py launcher.'
 }
 
 function Find-Pwsh {
@@ -150,28 +219,49 @@ Write-Host "cmd     $(if ($commandPrompt) { $commandPrompt } else { '(not found)
 
 $homeCfg = Join-Path $env:USERPROFILE '.agent-windows-shell.json'
 $cfg = Read-JsonObject -LiteralPath $homeCfg
-$configDefaults = [ordered]@{
-    kitRoot              = $KitRoot
-    gitBash              = $gitBash
-    powerShell7          = $pwsh
-    commandPrompt        = $commandPrompt
-    internalHostPatterns = @()
-    useNoProxyEnv        = $true
-    utf8Prefix           = $true
-    wrapHeredoc          = $true
-    wrapAndAnd           = $true
-    autoRouteBash        = $true
-    autoRouteCmd         = $true
-    rfc1918NoProxy       = $true
+# The config holds machine facts and the user's own overrides. Behaviour flags
+# live as defaults in the code, so a changed default reaches every install.
+$detected = [ordered]@{
+    gitBash       = $gitBash
+    powerShell7   = $pwsh
+    commandPrompt = $commandPrompt
 }
-foreach ($name in $configDefaults.Keys) {
-    if ($name -in @('kitRoot', 'gitBash', 'powerShell7', 'commandPrompt') -or
-        -not $cfg.PSObject.Properties[$name]) {
-        Set-ObjectProperty -Object $cfg -Name $name -Value $configDefaults[$name]
+foreach ($name in $detected.Keys) {
+    Set-ObjectProperty -Object $cfg -Name $name -Value $detected[$name]
+}
+# Older installers copied every default into this file. Drop those copies
+# (and the unused kitRoot) so they stop pinning old behaviour.
+$legacyDefaults = [ordered]@{
+    useNoProxyEnv  = $true
+    utf8Prefix     = $true
+    wrapHeredoc    = $true
+    wrapAndAnd     = $true
+    autoRouteBash  = $true
+    autoRouteCmd   = $true
+    rfc1918NoProxy = $true
+}
+$removed = @()
+foreach ($name in $legacyDefaults.Keys) {
+    $property = $cfg.PSObject.Properties[$name]
+    if ($property -and $property.Value -eq $legacyDefaults[$name]) {
+        $cfg.PSObject.Properties.Remove($name)
+        $removed += $name
     }
+}
+$patterns = $cfg.PSObject.Properties['internalHostPatterns']
+if ($patterns -and @($patterns.Value).Count -eq 0) {
+    $cfg.PSObject.Properties.Remove('internalHostPatterns')
+    $removed += 'internalHostPatterns'
+}
+if ($cfg.PSObject.Properties['kitRoot']) {
+    $cfg.PSObject.Properties.Remove('kitRoot')
+    $removed += 'kitRoot'
 }
 Write-Utf8NoBom -LiteralPath $homeCfg -Value ($cfg | ConvertTo-Json -Depth 10)
 Write-Host "config  $homeCfg"
+if ($removed.Count -gt 0) {
+    Write-Host "        dropped legacy defaults: $($removed -join ', ')"
+}
 
 & $python (Join-Path $KitRoot 'src\rewrite_windows_shell.py') --test
 if ($LASTEXITCODE -ne 0) { throw 'rewrite tests failed' }
@@ -187,48 +277,52 @@ if ($Profile) {
     $profileDir = Join-Path $env:USERPROFILE 'Documents\PowerShell'
     if (-not (Test-Path $profileDir)) { New-Item -ItemType Directory -Force -Path $profileDir | Out-Null }
     $userProfile = Join-Path $profileDir 'Microsoft.PowerShell_profile.ps1'
-    $snippet = @'
-# agent-windows-shell (do not edit; managed by install.ps1)
-$root = $env:AGENT_WINDOWS_SHELL_ROOT
-if (-not $root) {
-    $cfg = Join-Path $env:USERPROFILE '.agent-windows-shell.json'
-    if (Test-Path -LiteralPath $cfg) {
-        $root = (Get-Content -LiteralPath $cfg -Raw -Encoding UTF8 | ConvertFrom-Json).kitRoot
-    }
-}
-if ($root) {
-    $kitProfile = Join-Path $root 'src\profile.ps1'
-    if (Test-Path -LiteralPath $kitProfile) { . $kitProfile }
-}
-'@
+    # A literal path keeps shell start-up cheap: no env lookup, no JSON parse.
+    $kitProfile = Join-Path $KitRoot 'src\profile.ps1'
+    $quotedProfile = "'" + $kitProfile.Replace("'", "''") + "'"
+    $begin = '# >>> agent-windows-shell (managed by install.ps1; do not edit) >>>'
+    $end = '# <<< agent-windows-shell <<<'
+    $snippet = @(
+        $begin,
+        "if ([IO.File]::Exists($quotedProfile)) { . $quotedProfile }",
+        $end
+    ) -join "`r`n"
     $existing = ''
-    if (Test-Path $userProfile) {
-        $existing = Get-Content -LiteralPath $userProfile -Raw -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $userProfile) {
+        $existing = Get-Content -LiteralPath $userProfile -Raw -Encoding UTF8
+        if ($null -eq $existing) { $existing = '' }
     }
-    if ($existing -match 'agent-windows-shell \(do not edit') {
-        Write-Host "profile $userProfile (already wired)"
+    $managed = '(?s)' + [regex]::Escape($begin) + '.*?' + [regex]::Escape($end)
+    # The first release wrote an unmarked block that read env vars and JSON.
+    $legacy = '(?s)# agent-windows-shell \(do not edit; managed by install\.ps1\)\r?\n' +
+        '\$root = .*?if \(\$root\) \{\r?\n[^\r\n]*\r?\n[^\r\n]*\r?\n\}'
+    if ($existing -match $managed) {
+        $updated = [regex]::Replace($existing, $managed, { param($m) $snippet })
+        $state = 'refreshed'
+    } elseif ($existing -match $legacy) {
+        $updated = [regex]::Replace($existing, $legacy, { param($m) $snippet })
+        $state = 'upgraded from the first release'
     } elseif ([string]::IsNullOrWhiteSpace($existing)) {
-        Set-Content -LiteralPath $userProfile -Value $snippet.TrimStart() -Encoding UTF8
-        Write-Host "profile $userProfile (written)"
+        $updated = $snippet + "`r`n"
+        $state = 'written'
     } else {
-        Add-Content -LiteralPath $userProfile -Value $snippet -Encoding UTF8
-        Write-Host "profile $userProfile (appended)"
+        $updated = $existing.TrimEnd() + "`r`n`r`n" + $snippet + "`r`n"
+        $state = 'appended'
     }
+    if ($updated -ne $existing) {
+        Write-Utf8NoBom -LiteralPath $userProfile -Value $updated
+    } else {
+        $state = 'unchanged'
+    }
+    Write-Host "profile $userProfile ($state)"
 }
 
+$skillSource = Join-Path $KitRoot 'skills\windows-agent-shell'
+
 if ($Skill) {
-    $skillSrc = Join-Path $KitRoot 'adapters\generic\SKILL.md'
-    $skillDirs = @(
-        (Join-Path $env:USERPROFILE '.cursor\skills\windows-agent-shell'),
-        (Join-Path $env:USERPROFILE '.agents\skills\windows-agent-shell')
-    )
-    foreach ($d in $skillDirs) {
-        $parent = Split-Path -Parent $d
-        if (-not (Test-Path $parent)) { continue }
-        New-Item -ItemType Directory -Force -Path $d | Out-Null
-        Copy-Item -LiteralPath $skillSrc -Destination (Join-Path $d 'SKILL.md') -Force
-        Write-Host "skill   $d\SKILL.md"
-    }
+    # Cursor reads personal skills from ~\.cursor\skills only; do not add copies elsewhere.
+    Install-SkillLink -Source $skillSource `
+        -LinkPath (Join-Path $env:USERPROFILE '.cursor\skills\windows-agent-shell')
 }
 
 if ($Cursor) {
@@ -260,16 +354,16 @@ if ($Cursor) {
         -Entry $rewriteEntry -ScriptPath $rewrite
     Write-Utf8NoBom -LiteralPath $hooksPath `
         -Value ($hooks | ConvertTo-Json -Depth 20)
-    $ruleSrc = Join-Path $KitRoot 'adapters\cursor\windows-powershell-agent.mdc'
-    $ruleDstDir = Join-Path $cursorDir 'rules'
-    if (-not (Test-Path $ruleDstDir)) { New-Item -ItemType Directory -Force -Path $ruleDstDir | Out-Null }
-    Copy-Item -LiteralPath $ruleSrc -Destination (Join-Path $ruleDstDir 'windows-powershell-agent.mdc') -Force
     Write-Host "cursor  $hooksPath"
+    # Cursor ignores ~\.cursor\rules; an earlier release copied a rule file there.
+    $staleRule = Join-Path $cursorDir 'rules\windows-powershell-agent.mdc'
+    if (Test-Path -LiteralPath $staleRule) {
+        Remove-Item -LiteralPath $staleRule -Force
+        Write-Host "cursor  removed unused $staleRule"
+    }
 
     $settingsPath = Join-Path $env:APPDATA 'Cursor\User\settings.json'
     if (Test-Path (Split-Path $settingsPath)) {
-        $settingsDir = Split-Path $settingsPath
-        if (-not (Test-Path $settingsDir)) { New-Item -ItemType Directory -Force -Path $settingsDir | Out-Null }
         $overlay = @{
             'terminal.integrated.defaultProfile.windows' = 'PowerShell'
             'terminal.integrated.env.windows'           = @{
@@ -283,8 +377,14 @@ if ($Cursor) {
                 args = @('-NoLogo')
             }
         }
-        if (Test-Path $settingsPath) {
-            $cur = Read-JsonObject -LiteralPath $settingsPath
+        $settingsExist = Test-Path $settingsPath
+        $cur = $null
+        if ($settingsExist) {
+            try { $cur = Read-JsonObject -LiteralPath $settingsPath } catch { $cur = $null }
+        }
+        if ($settingsExist -and $null -eq $cur) {
+            Write-Warning "$settingsPath is not plain JSON; left unchanged. Add adapters\cursor\settings.snippet.json by hand."
+        } elseif ($settingsExist) {
             $map = @{}
             $cur.PSObject.Properties | ForEach-Object { $map[$_.Name] = $_.Value }
             $envMap = @{}
@@ -296,10 +396,22 @@ if ($Cursor) {
                 $envMap[$name] = $overlay['terminal.integrated.env.windows'][$name]
             }
             $overlay['terminal.integrated.env.windows'] = $envMap
-            foreach ($k in $overlay.Keys) { $map[$k] = $overlay[$k] }
-            Write-Utf8NoBom -LiteralPath $settingsPath `
-                -Value ($map | ConvertTo-Json -Depth 20)
-            Write-Host "cursor  $settingsPath (merged)"
+            # settings.json is the user's own file (comments, ordering): rewrite
+            # it only when a managed key actually changes.
+            $pending = @($overlay.Keys | Where-Object {
+                    -not $map.ContainsKey($_) -or
+                    (Get-CanonicalJson $map[$_]) -ne (Get-CanonicalJson $overlay[$_])
+                } | Sort-Object)
+            if ($pending.Count -eq 0) {
+                Write-Host "cursor  $settingsPath (unchanged)"
+            } elseif ((Get-Content -LiteralPath $settingsPath -Raw -Encoding UTF8) -match '(?m)^\s*(//|/\*)') {
+                Write-Warning "$settingsPath has comments that a rewrite would drop; left unchanged. Add these keys by hand: $($pending -join ', ') (see adapters\cursor\settings.snippet.json)"
+            } else {
+                foreach ($k in $pending) { $map[$k] = $overlay[$k] }
+                Write-Utf8NoBom -LiteralPath $settingsPath `
+                    -Value ($map | ConvertTo-Json -Depth 20)
+                Write-Host "cursor  $settingsPath (merged: $($pending -join ', '))"
+            }
         } else {
             Write-Utf8NoBom -LiteralPath $settingsPath `
                 -Value ($overlay | ConvertTo-Json -Depth 20)
@@ -336,9 +448,8 @@ if ($Claude) {
             -Value ($doc | ConvertTo-Json -Depth 8)
         Write-Host "claude  $settingsPath"
     }
-    $skillDir = Join-Path $claudeDir 'skills\windows-agent-shell'
-    New-Item -ItemType Directory -Force -Path $skillDir | Out-Null
-    Copy-Item -LiteralPath (Join-Path $KitRoot 'adapters\generic\SKILL.md') -Destination (Join-Path $skillDir 'SKILL.md') -Force
+    Install-SkillLink -Source $skillSource `
+        -LinkPath (Join-Path $claudeDir 'skills\windows-agent-shell')
 }
 
 if ($DisableCursorAttribution) {

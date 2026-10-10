@@ -22,7 +22,9 @@ Use PowerShell 7 as the stable host, then choose another interpreter only when t
 - `curl.exe --max-time 30` for HTTP while preserving the configured proxy; add `--noproxy '*'` only for an explicitly direct request or a target covered by `NO_PROXY`; use `git commit --file` for multi-line messages
 - After `git` / `npm` / compilers: check `$LASTEXITCODE`
 - If `agent-windows-shell` is installed, let its hook route only clear Bash or batch syntax
-- Without a pre-tool hook, use `rewrite_windows_shell.py --run '<command>'` only after resolving and verifying that script path; if it is unavailable, run the command directly in the selected host. Inspect routing with `--explain '<command>'` when the wrapper is available
+- `python` may not be on PATH: use `py -3` or the full `python.exe` path
+- When a command ends in an auto-formatted table (`... | Select-Object Name`), add `| Format-Table | Out-String`; some hosts drop that output otherwise
+- Without a pre-tool hook, use `py -3 <kit>\src\rewrite_windows_shell.py --run '<command>'` only after resolving and verifying that script path; if it is unavailable, run the command directly in the selected host. Inspect routing with `--explain '<command>'` when the wrapper is available
 - Explicitly select `bash`, `cmd`, or `wsl.exe` when ambiguity remains
 
 ## Do not
