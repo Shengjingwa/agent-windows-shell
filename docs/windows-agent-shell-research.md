@@ -100,11 +100,19 @@ Cursor 给每条 Shell 命令生成的脚本以 `exit $COMMAND_EXIT_CODE` 结尾
 | `Get-Date \| Select-Object Year, Month; "v=$v"` | 0 行 | 4 行 |
 | `'{"a":1,"b":2}' \| ConvertFrom-Json; Write-Output AFTER` | 0 行 | 表格和 `AFTER` 都在 |
 | `"a,b`n1,2" \| ConvertFrom-Csv; Write-Output AFTER` | 0 行 | 表格和 `AFTER` 都在 |
+| `… \| ConvertFrom-Csv \| Select-Object -First 1; Write-Output done` | 0 行 | 表格和 `done` 都在 |
+| `$j = … \| ConvertFrom-Json; $j.items; Write-Output done` | 0 行 | 表格和 `done` 都在 |
+| `Get-Location; Write-Output done` | 0 行 | 路径和 `done` 都在 |
 | 5 个属性的 JSON 对象（按列表排版） | 都在 | 都在 |
 | 路径不存在（只有错误） | 5 行 | 5 行 |
 | 末尾自己写 `exit 3` | 0 行 | 0 行（退出码都是 3） |
 
-规则只在命令里有未收口的小表格时才包（`Select-Object` 带 1–4 个属性、`[pscustomobject]@{…}`；已经接了 `Format-Table`、`Out-String`、重定向或赋值的语句不算）。第二轮审查后补了一条：语句直接打印 `ConvertFrom-Json`、`ConvertFrom-Csv`、`Import-Csv`、`Invoke-RestMethod` 的结果时也包，后面只允许接 `Where-Object`、`Sort-Object` 这类不改变记录的阶段；赋值、`(…).name` 取属性、`ForEach-Object` 投影都不打印记录，不包。第一版只看命令名，重放时会多包 105 条（多数是 `foreach` 块里的 `$j = … | ConvertFrom-Json`）；按嵌套层次判断后，历史命令里没有一条因此被包，也没有找到漏掉的真实案例。含不含 `git`、`py` 这类原生程序都包，因为 PowerShell 和原生程序混在一条命令里恰恰最常见：用这套规则重放 11,855 条历史命令，652 条（5.5%）会被包，其中 355 条纯 PowerShell，297 条混有原生程序。
+命中下面任一条就包：
+
+- 某条语句的 `Select-Object` 列出 1–4 个属性，而且这条语句不是赋值，也没有接 `Format-Table`、`Out-String`、原生程序或重定向。
+- 命令里任何位置出现会产生记录对象的来源：`ConvertFrom-Json`、`ConvertFrom-Csv`、`Import-Csv`、`Invoke-RestMethod`（`irm`）、`[pscustomobject]@{…}`、`New-Object PSObject`、`$PSVersionTable`、`Get-Location`（`pwd`、`gl`）、`Get-Member`（`gm`）。
+
+第二种情况原先按语句和嵌套层次判断记录是否被直接打印。第三轮审查找出三种漏掉的写法：先赋值再单独打印（`$j = … | ConvertFrom-Json; $j.items`）、`ConvertFrom-Csv | Select-Object -First 1`、`Get-Location`（见上表）。记录到达输出的路径太多，判断越细越容易漏，而多包一层的代价很小（见下文），所以改成出现就包。含不含 `git`、`py` 这类原生程序都包，因为 PowerShell 和原生程序混在一条命令里恰恰最常见。用这套规则重放 11,855 条历史命令，1,098 条（9.3%）会被包，比按语句判断时多 446 条。多出来的约四分之三是先把 `ConvertFrom-Json`、`Invoke-RestMethod` 的结果赋给变量的写法，其次是 `Get-Location`（43 条）。包一层还有三点小差别：顶层 `return` 之后的退出码以块内最后一个原生程序为准；块内 `$MyInvocation.MyCommand.Path` 为空；报错行号多 1。
 
 包一层的代价是原生程序的输出改走 PowerShell 管道，不再直通控制台。本机实测（每组 7 次取中位数，原生输出由 Python 生成）：
 
@@ -114,7 +122,7 @@ Cursor 给每条 Shell 命令生成的脚本以 `exit $COMMAND_EXIT_CODE` 结尾
 | 3,000 | 553 ms | 860 ms | +307 ms |
 | 20,000 | 584 ms | 1,794 ms | +1.2 s |
 
-多数命令的输出在几百行以内，增加的时间可以忽略；输出特别大时多花几百毫秒到一秒多，比 agent 因为输出丢了再跑一遍便宜。这 652 条命令包前包后都能被 PowerShell 解析器解析：646 条两边都通过，6 条两边都报错（原命令本身就有语法错误），没有“原来能解析、包完不能解析”的命令。包完仍保留 `$LASTEXITCODE`，Cursor 脚本用它作退出码，单元测试里用真实 `pwsh` 验证了退出码 7 能传出。
+多数命令的输出在几百行以内，增加的时间可以忽略；输出特别大时多花几百毫秒到一秒多，比 agent 因为输出丢了再跑一遍便宜。这 1,098 条命令包前包后都交给 PowerShell 解析器检查：1,090 条两边都通过，8 条两边都报错（原命令本身就有语法错误），没有“原来能解析、包完不能解析”的命令。包完仍保留 `$LASTEXITCODE`，Cursor 脚本用它作退出码，单元测试里用真实 `pwsh` 验证了退出码 7 能传出。
 
 两点没覆盖：原生程序输出二进制时，经 PowerShell 管道会按控制台编码转一次文本；`utf8Prefix` 关闭且 profile 没加载的宿主上，非 ASCII 原生输出可能多一次转码。这台机器的 Shell 工具加载 profile，控制台输出已经是 UTF-8，没有这个问题。
 
@@ -209,7 +217,7 @@ Hook 的选择顺序是：
 1. 以 `pwsh`、`powershell`、`cmd`、`bash`、`sh` 或 `wsl` 开头时，保留显式选择。
 2. 命令里有 heredoc（`<<`）时：`<<` 之前的文本不像 PowerShell（没有 `$x =`、`& $x`、`Get-*` 等 cmdlet、`$env:`、`@{`、`::`、盘符路径），且没有危险命令，才交给 Git Bash。全量历史里 50 条命令含 `<<`，只有 2 条是真的 Bash heredoc，其余多是 `<<<<<<<` 冲突标记，所以必须先看命令头。
 3. 识别到 PowerShell 变量、cmdlet、类型表达式时，保留宿主。
-4. 识别到删除、磁盘写入、关机等危险命令时，禁止自动切换解释器。这一步查原始文本，不查遮罩后的文本，命令词出现在任何位置都算（`env rm`、`xargs rm`、`bash -c 'rm …'`、`find -delete`、`git clean`）。原因是 heredoc 正文或 `echo` 里的一个撇号会在 PowerShell 的词法里打开字符串，把后面的行全部遮掉。宁可多拦：被拦下的命令留在 PowerShell，最多报错，不会执行。`format` 和 `truncate` 在提交信息里常见，只认 `format D:`、`truncate -s` 这种命令形式。
+4. 识别到删除、磁盘写入、关机等危险命令时，禁止自动切换解释器。这一步查原始文本，不查遮罩后的文本，命令词出现在任何位置都算（`env rm`、`xargs rm`、`bash -c 'rm …'`、`find -delete`、`git clean`）。原因是 heredoc 正文或 `echo` 里的一个撇号会在 PowerShell 的词法里打开字符串，把后面的行全部遮掉。宁可多拦：被拦下的命令留在 PowerShell，最多报错，不会执行。去掉反斜杠、引号、`^`、`%VAR%`、`${X:-…}`、`$1` 并接上续行后再查一遍，`r\m`、`r''m`、`r^d` 这类写法也算。`robocopy` 一律算，因为 `/MIR` 可以放在续行或变量里；`reg`、`sc`、`schtasks`、`net`、`vssadmin`、`wmic`、`bcdedit` 和 `delete` 出现在同一条命令里就算。代价是 Python 原始字符串 `r"D:\…"`、`r'^\d'` 去掉引号后像 `rd`：重放历史命令有 35 条因此被标为危险，它们本来就留在 PowerShell，路由不变；一条带这种字符串的 Bash 命令会留在 PowerShell 里报错，而不是被送进 Git Bash。`format` 和 `truncate` 在提交信息里常见，只认 `format D:`、`truncate FILE -s 0` 这种命令形式。唯一不查的是提交信息正文：`git`/`gh` 的 `-m`/`--body` 接 `"$(cat <<'EOF' … EOF)"`、结束标记带引号时，正文不展开，只会成为文字。这是尽力而为的检查，不是沙箱。
 5. 识别到 `export`、`source`、`[[ ... ]]`、Bash 控制流等语法时，交给 Git Bash。
 6. 识别到 `@echo off`、`setlocal`、`%VAR%`、`if errorlevel` 等语法时，交给 `cmd.exe /d`。命令里有 `$name` 变量时不交：批处理没有这种变量，`$i%2` 是 PowerShell 的取模。
 7. 其他命令保留宿主。WSL 不自动选择。
@@ -268,12 +276,24 @@ Hook 不处理以下情况：
   - 直接打印 `ConvertFrom-Json` 等命令的结果时，输出同样会被吞（见“输出丢失”一节）。
   - 小问题也一并修了：`[[ … ]]` 的匹配限定在一行 300 个字符以内，并要求内侧有空格（PowerShell 泛型 `List[[string]]` 不再被当成 Bash）；只给测试用的 `classify_command` 删掉，测试改走 `plan_command`。
   - 查 Claude Code 官方文档时发现适配器有两处旧问题：Claude 在 Windows 上用 Git Bash 执行 shell 形式的 Hook 命令，而适配器写的是 PowerShell 的 `& "…"`；Bash 工具的命令也被送进来做 PowerShell 改写，`ls -la` 会变成 `Get-ChildItem`。现在改用 exec 形式（`command` + `args`，不经过 shell），只挂 PowerShell 工具，脚本也不再处理 Bash 工具的命令。这台机器没装 Claude Code，这条路径没有实机验证。
-  - 每项修复各有测试；把 14 处修复逐个改回去，测试都能抓到。其中一处是新判断自己带来的：最初每遇到一个 `}` 都把前面整段文本拼起来查，单条语句有几千个块时按平方增长（82 KB 要 8.8 秒）；改成只看块前面几十个字符后，150–490 KB 的单行命令 0.5–2.0 秒，随长度线性增长。
-- 83/83 Python 单元测试通过，其中包括：用带 BOM 的 payload 起真实子进程跑 Hook；常见路径不导入 `argparse`、`subprocess`、`dataclasses` 等重模块；PowerShell 7 / 5.1 / 未知宿主的包装分支；输出丢失保护的判定，以及用真实 `pwsh` 按 Cursor 的“命令 + `exit $LASTEXITCODE`”外壳跑一遍，确认表格、后续输出和原生程序的退出码 7 都还在；`session_start.py` 按注册表补齐 PATH 后再判断 `python`；审查发现的每个问题各有一条测试，另外用 10 个故意改坏的版本（审查里没被测试抓住的 6 个，加上把每项修复改回去）逐个跑，全部被测试抓到。
+  - 每项修复各有测试；把 14 处修复逐个改回去，测试都能抓到。其中一处是新判断自己带来的：最初每遇到一个 `}` 都把前面整段文本拼起来查，单条语句有几千个块时按平方增长（82 KB 要 8.8 秒）；改成只看块前面几十个字符后，150–490 KB 的单行命令 0.5–2.0 秒，随长度线性增长。这套按块判断的逻辑在第四轮审查后整体删掉了（见下）。
+- 第三轮独立审查（Opus，看第一轮修复的 diff）发现一处由修复带来的回归：安装器识别旧 profile 块的正则会越过手改过的结尾 `}`，把后面的用户代码一起删掉，而且不留备份，PowerShell 7 和 5.1 下都复现。现在只替换和第一版逐行一致的旧块，替换前存一份 `.bak`；手改过的旧块原样保留，安装器提示手动删除。同一份审查的其他问题也都修了：
+  - 危险命令换种写法仍会被送进 Git Bash 或 cmd：72 种写法里 61 种被路由，审查在隔离目录里实际执行了 13 条，12 条真的删除或截断了测试数据（`r\m`、`r''m`、`${X:-rm}`、`r^d`、heredoc 后面的 `git -C . clean` 等）。现在去掉转义和引号后再查一遍（见“语义路由”第 4 条），并补了 `git -C … clean`、`git.exe clean`、`truncate FILE -s 0`、`format.com D:`。
+  - 另有四种写法的规划时间按平方增长，约 100 KB 就超过 Hook 的 10 秒时限：未闭合的 `[[`、不带空格的长串管道、`set -eeee…`、每处别名改写都重建整条字符串。现在都限定了扫描范围，或改成一次拼接。
+  - 提交信息 heredoc 被拦得太多：20 条真实写法里 15 条（正文里有 reboot、rm unused imports 之类的词）留在 PowerShell 报解析错误。现在只放过 `git`/`gh` 的 `-m`/`--body "$(cat <<'EOF' …)"` 正文，结束标记必须带引号；`eval`、不带引号的结束标记、结束标记之后的文本照查。
+  - 安装器：自检失败之前已经改写了配置，第一版 profile 块因此加载不到工具包（现在先跑自检，写完 profile 再写配置）；不带 BOM 的 UTF-16 profile 被当成 UTF-8 追加内容（现在视为无法读取，不改）；旧块和新块同时存在时旧块留着（现在删掉）；带 BOM 的 profile 改写后丢了 BOM（现在保留）。
+  - `docker compose down --remove-orphans` 被当成 PowerShell 语法（`remove-orphans` 被认成 `Remove-Item` 这类 cmdlet 名），现在 cmdlet 名前面不能是 `-`。
+- 第四轮独立审查（Opus，看第二轮修复的 diff）确认危险命令没有新增可走的路，但有三项没达标，都已修复：
+  - `robocopy /MIR` 放在续行上、写成 `-MIR` 或放进变量，`sc.exe` 带引号的完整路径、`sc \\server delete`、`schtasks /tn x /delete` 都能绕过检查；审查按 Cursor 的执行方式实际删掉了 4 次测试文件。现在命令里出现 `robocopy` 就算；`reg`、`sc`、`schtasks`、`net`、`vssadmin`、`wmic`、`bcdedit` 和 `delete` 出现在同一条命令里就算；续行先接上再查。顺带补了 `rsync --del`、`git reset --hard`、`git branch -D`。
+  - 输出保护漏了常见写法：58 条真实写法里 31 条在 Cursor 的脚本外壳里仍然一行不剩，其中 6 条在 Cursor 会话里实测确认。现在改成命令里出现记录来源就包（见“输出丢失”一节），按块判断的逻辑随之删掉。
+  - robocopy 的正则按平方增长（80 KB 要 3.6 秒），随第一项改成线性。
+  - 其余几项：只有机器级 `PSModulePath` 的进程（例如从资源管理器启动的 Claude Code）会被误判为 5.1，现在机器目录不算证据；5.1 下给以 `using`、`param` 开头的脚本补 UTF-8 前缀会让脚本解析失败，现在跳过；升级时第一版写的 shell 形式 Claude 条目还留着，Git Bash 执行它会以退出码 2 拦下每次调用，现在合并时替换；文档文件夹改用不检查存在性的查法，`USERPROFILE` 末尾带 `\` 时也能比对；安装器的提示改成纯 ASCII，5.1 在 GBK 控制台下不再乱码。
+  - 修复后用 11,855 条历史命令重放：没有命令换 shell；446 条多了输出保护；11 条 `git push --set-upstream` 的原因标签从 PowerShell 语法变回普通命令；39 条的原因标签变成 `unsafe-command`，其中 4 条是真的 `git reset --hard`、`git branch -D`，35 条是上面说的 Python 原始字符串。规划全部命令的总耗时从 11.3 秒降到 6.5 秒。
+- 93/93 Python 单元测试通过，其中包括：安装器的 5 条测试，在临时 home 目录里用 Windows PowerShell 5.1 实跑（第一版块逐字替换并保留用户代码、手改过的块不动、旧块与新块并存时删旧块、无 BOM 的 UTF-16 不动、保留 BOM）；第三、四轮修复后又用 36 个故意改坏的版本逐个跑，第一次有 1 个没被抓到（别名改写后沿用旧的遮罩），补测试后全部被抓到；用带 BOM 的 payload 起真实子进程跑 Hook；常见路径不导入 `argparse`、`subprocess`、`dataclasses` 等重模块；PowerShell 7 / 5.1 / 未知宿主的包装分支；输出丢失保护的判定，以及用真实 `pwsh` 按 Cursor 的“命令 + `exit $LASTEXITCODE`”外壳跑一遍，确认表格、后续输出和原生程序的退出码 7 都还在；`session_start.py` 按注册表补齐 PATH 后再判断 `python`；审查发现的每个问题各有一条测试，另外用 10 个故意改坏的版本（审查里没被测试抓住的 6 个，加上把每项修复改回去）逐个跑，全部被测试抓到。
 - 装好后在 Cursor 里直接验证（2026-10-10）：`Get-ChildItem C:\Windows -Directory | Select-Object -First 3 Name` 输出了表格；一条同时含表格、`cmd /c` 和 `&&` 的命令，没加保护时只输出第一行，加上后表格和 `chain ok` 都在；表格加 `py -3 -c "…sys.exit(5)"` 的命令，Cursor 报告退出码 5。Hook 日志显示这条 `&&` 命令没有被包进 PowerShell 7 子进程，说明 Hook 进程认出了宿主是 `pwsh.exe`。
 - 用当前 profile 启动的新 `pwsh`，即使继承了只有 12 项的旧 `PATH`，也能找到 `python`、`node` 和 `gh`；Windows PowerShell 5.1 点源同一个文件也正常。
 - 用 11,855 条历史命令对比新旧路由：11,476 条结果相同；355 条（只算纯 PowerShell 命令，后来又放宽到含原生程序的命令，见上）只多了输出保护；21 条只是原因标签变了（字符串里的 `$(…)` 现在被识别为 PowerShell 语法）；3 条被改成 Bash heredoc，收紧命令头判断后只剩 2 条真正的 heredoc。没有异常。
-- 安装器在隔离目录里分别用 PowerShell 7.6.4 和 Windows PowerShell 5.1 各跑两遍：第二遍无改动，用户已有的 hooks 条目、profile 内容保留，`hooks.json` 没有 BOM。`settings.json` 带注释（包括行尾注释）时两种 PowerShell 都不改它，只提示要手动加的键；用本机真实 `settings.json` 的副本跑，结果是“不变”，文件哈希一致。审查修复后另跑了 31 项场景检查（GBK profile、手改过的旧块、只装 `-Cursor`、行尾注释、文件符号链接、重复安装），PowerShell 7 和 5.1 下全部通过。安装器没有带 `-Env` 运行，没有改真实环境变量。
+- 安装器在隔离目录里分别用 PowerShell 7.6.4 和 Windows PowerShell 5.1 各跑两遍：第二遍无改动，用户已有的 hooks 条目、profile 内容保留，`hooks.json` 没有 BOM。`settings.json` 带注释（包括行尾注释）时两种 PowerShell 都不改它，只提示要手动加的键；用本机真实 `settings.json` 的副本跑，结果是“不变”，文件哈希一致。审查修复后另跑了 31 项场景检查（GBK profile、手改过的旧块、只装 `-Cursor`、行尾注释、文件符号链接、重复安装），PowerShell 7 和 5.1 下全部通过。第三、四轮修复后扩到 52 项，新增手改旧块不动、旧块逐字替换并备份、旧块与新块并存、无 BOM 的 UTF-16、带 BOM 的 UTF-8、自检先于任何写入、Claude 设置合并并替换旧条目，两种 PowerShell 下也全部通过；跑完后仓库里的技能文件和真实 profile 都没变。安装器没有带 `-Env` 运行，没有改真实环境变量。
 - `--explain` 与 Hook 使用同一份路由计划，可以稳定报告 `shell`、`reason`、解释器路径和改写项。
 - `--run` 在无 Hook 路径下直接启动 PowerShell、Git Bash 或 `cmd.exe`，已验证中文输出、短路语义和退出码传播。
 - Python 文件通过 `py_compile`。

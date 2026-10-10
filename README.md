@@ -25,13 +25,13 @@ Set-Location <这个目录>
 .\install.ps1
 ```
 
-默认会：写 `%USERPROFILE%\.agent-windows-shell.json`（只存本机找到的路径和你自己的覆盖项）、接好 Cursor hook、在 PowerShell 7 profile 里写一个带标记的块、把技能链接到 `~\.cursor\skills`、设 `PYTHONUTF8`。可以重复运行，旧版安装器留下的块和默认值会被升级掉。然后**重载** Cursor / 对应 agent，**新开一轮对话**。
+默认会：写 `%USERPROFILE%\.agent-windows-shell.json`（只存本机找到的路径和你自己的覆盖项）、接好 Cursor hook、在 PowerShell 7 profile 里写一个带标记的块、把技能链接到 `~\.cursor\skills`、设 `PYTHONUTF8`。安装器先跑单元测试，没通过就什么都不写。可以重复运行，旧版安装器留下的块和默认值会被升级掉。然后**重载** Cursor / 对应 agent，**新开一轮对话**。
 
 | 开关 | 作用 |
 |------|------|
 | `-Cursor` | `~\.cursor\hooks.json` + 合并终端相关 settings（只在受管键有变化时才改写；文件里有注释或不是纯 JSON 时不动，只给出提示）；清掉旧版拷进 `~\.cursor\rules` 的规则文件（Cursor 不读那个目录） |
-| `-Claude` | 写入或提示合并 `~\.claude\settings.json`（只挂 PowerShell 工具，用 exec 形式启动 Python），并链接技能 |
-| `-Profile` | 在 PowerShell 7 profile（`文档\PowerShell`，跟随 OneDrive 等文档文件夹重定向）写 `# >>> agent-windows-shell` 块，直接点源 `src\profile.ps1`；重装会刷新这个块，块外内容不动；profile 不是 UTF-8 编码时不改，只提示 |
+| `-Claude` | 在 `~\.claude\settings.json` 的 `PreToolUse` 里挂 PowerShell 工具（exec 形式启动 Python），替换本项目旧版写的条目（包括 Git Bash 跑不了的 shell 形式），其他钩子和设置不动；文件不是纯 JSON 时不改，只提示手动合并。并链接技能 |
+| `-Profile` | 在 PowerShell 7 profile（`文档\PowerShell`，跟随 OneDrive 等文档文件夹重定向）写 `# >>> agent-windows-shell` 块，直接点源 `src\profile.ps1`；重装会刷新这个块，块外内容不动，原有的 BOM 保留。第一版安装器写的旧块只有和原样一致时才替换，替换前把原文件存为 `….agent-windows-shell.bak`；旧块被改过时不动，只提示手动删除。profile 不是 UTF-8 编码（包括没有 BOM 的 UTF-16）时不改，只提示 |
 | `-Skill` | 用 junction 把 `skills\windows-agent-shell` 链到 `~\.cursor\skills`，仓库更新即生效；不写 `~\.agents` |
 | `-Env` | 用户环境变量 UTF-8 / 工具包根目录 |
 | `-DisableCursorAttribution` | 关掉 Cursor CLI 的 Co-authored-by（IDE 里还要再关 Attribution） |
@@ -70,8 +70,8 @@ py -3 "$env:AGENT_WINDOWS_SHELL_ROOT\src\rewrite_windows_shell.py" --run 'export
 - `wrapHeredoc`（默认开）：检测到真实 bash heredoc 时，交给 Git Bash 执行
 - `autoRouteBash`（默认开）：识别到 `export`、`source`、`set -e`、`[[ ... ]]` 等明确 Bash 语法时，交给 Git Bash
 - `autoRouteCmd`（默认开）：识别到 `@echo off`、`setlocal`、`%VAR%` 等明确批处理语法时，交给 `cmd.exe /d`
-- `flushImplicitOutput`（默认开）：命令会打印自动表格时（如 `Get-ChildItem | Select-Object Name`，或直接打印 `ConvertFrom-Json`、`ConvertFrom-Csv`、`Import-Csv`、`Invoke-RestMethod` 的结果），包一层 `. { … } | Out-Host`，避免 Cursor 脚本末尾的 `exit` 把这些输出连同后面的输出一起吞掉。赋值（`$j = … | ConvertFrom-Json`）、取属性（`(…).name`）和 `ForEach-Object` 投影不打印记录，不包。包了之后原生程序的输出改走 PowerShell 管道，200 行约多 20 ms，20,000 行约多 1.2 s；原生输出按控制台编码解码，所以控制台要是 UTF-8（profile 或 `utf8Prefix` 负责），否则非 ASCII 字符会乱码
-- `utf8Prefix`（默认关）：每条命令前补一段 UTF-8 设置。profile 块只写给 PowerShell 7；宿主是 Windows PowerShell 5.1 时（看 `PSModulePath` 第一项是不是 `WindowsPowerShell\Modules`，不额外查进程），Hook 自动补这段，不用打开。宿主以 `-NoProfile` 启动的 PowerShell 7，或没装 profile 块时才需要打开。只装 `-Cursor`、profile 里又没有本项目的块时，安装器会提示
+- `flushImplicitOutput`（默认开）：命令可能打印自动表格时，包一层 `. { … } | Out-Host`，避免 Cursor 脚本末尾的 `exit` 把这些输出连同后面的输出一起吞掉。判断规则：`Select-Object` 列出 1–4 个属性（`Get-ChildItem | Select-Object Name`）；或者命令里任何位置出现 `ConvertFrom-Json`、`ConvertFrom-Csv`、`Import-Csv`、`Invoke-RestMethod`、`[pscustomobject]`、`Get-Location`、`Get-Member`、`$PSVersionTable`。后一类对象到达输出的路径太多（`(…).items`、先赋值再打印、`Select-Object -First 2`），逐一判断会漏，所以出现就包，多包无害。包了之后原生程序的输出改走 PowerShell 管道，200 行约多 20 ms，20,000 行约多 1.2 s；原生输出按控制台编码解码，所以控制台要是 UTF-8（profile 或 `utf8Prefix` 负责），否则非 ASCII 字符会乱码。另有三点小差别：顶层 `return` 之后的退出码以块内最后一个原生程序为准；块内 `$MyInvocation.MyCommand.Path` 为空；报错行号多 1
+- `utf8Prefix`（默认关）：每条命令前补一段 UTF-8 设置。profile 块只写给 PowerShell 7；宿主是 Windows PowerShell 5.1 时（看 `PSModulePath` 第一项是不是用户自己的 `WindowsPowerShell\Modules`，不额外查进程；只有系统目录说明不是从 PowerShell 启动的，不算），Hook 自动补这段，不用打开。命令以 `using` 或 `param(` 开头时不补，因为这两种语句必须在脚本最前面。宿主以 `-NoProfile` 启动的 PowerShell 7，或没装 profile 块时才需要打开。只装 `-Cursor`、profile 里又没有本项目的块时，安装器会提示
 
 改完不必重装。钩子每次启动会读这份文件。
 
@@ -100,7 +100,7 @@ Hook 只在高置信条件下切换解释器：
 - 路由扫描会屏蔽字符串、注释和 PowerShell here-string，避免把示例文本当成 shell 语法；双引号里的 `$( … )` 子表达式是代码，保持可见，所以 `git commit -m "$(cat <<'EOF' … EOF)"` 能被识别成 Bash。
 - heredoc 开头那一行出现 PowerShell 语法（`Set-Location …; & $py - <<'PY'`）时留在宿主，由 PowerShell 报出清楚的解析错误，而不是让 Git Bash 报 `command not found`。
 - URL 中的 `%20`、`%2F` 等百分号编码不会被当成批处理变量；闭合 `%VAR%`、参数变量和 `for` 变量仍可识别。
-- `rm`、`del`、`rd`、`diskpart`、`mkfs`、`dd`、`shutdown`、`shred`、`unlink`、`find -delete`、`rsync --delete`、`git clean`、`robocopy /MIR`（及 `/PURGE`、`/MOVE`）、`reg delete`、`sc delete`、`schtasks /delete`、`format D:`、`truncate -s` 等命令不触发自动路由。这项检查看原始文本，命令词出现在任何位置都算，包括 `env rm`、`xargs rm`、heredoc 正文和 heredoc 之后的行，宁可多拦。所以提交信息里写了 `rm` 这样的词，`git commit -m "$(cat <<'EOF' …)"` 也会留在 PowerShell，由 PowerShell 报出解析错误；这时改用 `git commit --file`。显式选择 shell 时仍尊重调用者意图。
+- `rm`、`del`、`rd`、`diskpart`、`mkfs`、`dd`、`shutdown`、`shred`、`unlink`、`find -delete`、`rsync --delete`（及 `--del`）、`git clean`（包括 `git -C . clean`）、`git reset --hard`、`git branch -D`、任何 `robocopy`、`format D:`、`truncate FILE -s 0` 等命令不触发自动路由。`reg`、`sc`、`schtasks`、`net`、`vssadmin`、`wmic`、`bcdedit` 和 `delete` 出现在同一条命令里也算，不管两者隔多远（`sc \\server delete svc`、`schtasks /tn x /delete`）。这项检查看原始文本，命令词出现在任何位置都算，包括 `env rm`、`xargs rm`、heredoc 正文和 heredoc 之后的行，宁可多拦。它还会接上续行（`\`、`^`、反引号加换行），去掉反斜杠、引号、`^`、`%VAR%`、`${X:-…}` 和 `$1` 再查一遍，所以 `r\m`、`r''m`、`r^d` 这类写法也拦得住。这只是尽力而为的检查，不是沙箱。唯一的例外是提交信息：`git` 或 `gh` 用 `-m`、`--message`、`-b`、`--body` 接 `"$(cat <<'EOF' … EOF)"`，且结束标记带引号时，正文不展开，只会成为提交或 PR 的文字，所以不查正文，结束标记之后的内容照查。结束标记不带引号、前面有 `eval`、或用 `git commit -F - <<EOF` 时，正文照查；正文提到 `rm` 等词就会留在 PowerShell 报解析错误，这时改用 `git commit --file`。显式选择 shell 时仍尊重调用者意图。
 
 路由后仍保留原有兼容处理：
 

@@ -25,7 +25,7 @@ Merge (keep your existing hooks):
 }
 ```
 
-`install.ps1 -Claude` writes `PYTHON_EXE` and `KIT_ROOT` for you, and links `skills/windows-agent-shell` into `~/.claude/skills/`.
+`install.ps1 -Claude` writes `PYTHON_EXE` and `KIT_ROOT` for you, and links `skills/windows-agent-shell` into `~/.claude/skills/`. If `settings.json` already exists and is plain JSON, the installer keeps your other settings and hooks and replaces any earlier entry of this kit. The first release wrote a shell-form entry (`& "python" "…"`, matcher `Bash|PowerShell|Shell`), which fails in Git Bash. If the file has comments or is not valid JSON, it is left unchanged and the installer prints the entry to add by hand.
 
 - The hook uses exec form (`args`). Claude Code runs a shell-form hook command in Git Bash when Git Bash is installed, and bash cannot parse a PowerShell `& "…"` call.
 - Only the PowerShell tool is matched. It is on by default on Windows without Git Bash; elsewhere set `CLAUDE_CODE_USE_POWERSHELL_TOOL=1`. The Bash tool already runs in Git Bash, so PowerShell rewrites would break it, and the script ignores Bash calls even if an older matcher still sends them.
