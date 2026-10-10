@@ -4,10 +4,11 @@
   "commandPrompt": null,
   "internalHostPatterns": [],
   "useNoProxyEnv": true,
-  "utf8Prefix": true,
+  "utf8Prefix": false,
   "wrapHeredoc": true,
   "wrapAndAnd": true,
   "autoRouteBash": true,
   "autoRouteCmd": true,
-  "rfc1918NoProxy": true
+  "rfc1918NoProxy": true,
+  "flushImplicitOutput": true
 }
