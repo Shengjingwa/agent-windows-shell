@@ -51,7 +51,6 @@ DEFAULTS = {
     "flushImplicitOutput": True,
 }
 
-RouteDecision = namedtuple("RouteDecision", "shell reason")
 CommandPlan = namedtuple(
     "CommandPlan",
     "shell reason command executable changes",
@@ -107,7 +106,8 @@ def _build_unsafe():
         r"reboot|shred|unlink)(?![\w-])"
         # Commit messages say "format" and "truncate"; require the command form.
         r"|(?<![\w.$-])format\s+(?:/\S+\s+)*[A-Za-z]:|(?<![\w.$-])truncate\s+-"
-        r"|(?<![\w-])-delete\b|\bgit\s+clean\b",
+        r"|(?<![\w-])--?delete\b|\bgit\s+clean\b|\brobocopy\b[^\n]*?/(?:mir|purge|move?)\b"
+        r"|\b(?:reg|sc|schtasks)(?:\.exe)?\s+/?delete\b",
         re.I,
     )
 
@@ -118,12 +118,14 @@ def _build_bash_signatures():
         ("source", re.compile(r"(?:^|[;\n])[ \t]*source\s+[^\s;]+", re.I)),
         ("export", re.compile(r"(?:^|[;\n])[ \t]*export\s+[A-Za-z_][A-Za-z0-9_]*=", re.I)),
         ("set-options", re.compile(r"(?:^|[;\n])[ \t]*set\s+-[a-zA-Z]*[euxo][a-zA-Z]*\b")),
-        ("double-brackets", re.compile(r"\[\[.*?\]\]", re.S)),
+        # Bash needs the inner spaces; PowerShell generics write `List[[string]]`.
+        # The bound keeps a long line of `[[` openers linear.
+        ("double-brackets", re.compile(r"(?<![\w\[])\[\[\s[^\n]{0,300}?\s\]\]")),
         ("parameter-expansion", re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*(?::[-+=?])")),
         (
             "control-flow",
             re.compile(
-                r"(?:^|\n)[ \t]*(?:if\b.*;\s*then|for\b.*;\s*do|while\b.*;\s*do|fi\b|done\b)",
+                r"(?:^|\n)[ \t]*(?:if\b.*;[ \t]*then|for\b.*;[ \t]*do|while\b.*;[ \t]*do|fi\b|done\b)",
                 re.I,
             ),
         ),
@@ -320,6 +322,17 @@ def host_is_powershell7() -> bool | None:
     return None
 
 
+def host_is_windows_powershell() -> bool:
+    """Cheap guess that Windows PowerShell 5.1 launched us.
+
+    Each PowerShell puts its own user module folder first in PSModulePath and
+    child processes inherit it, so this needs no process lookup. The kit
+    profile only targets PowerShell 7, so a 5.1 host lacks its UTF-8 setup.
+    """
+    first = os.environ.get("PSModulePath", "").split(";")[0].rstrip("\\/")
+    return first.lower().endswith(("\\windowspowershell\\modules", "/windowspowershell/modules"))
+
+
 # --------------------------------------------------------------------------
 # Scanning
 # --------------------------------------------------------------------------
@@ -475,20 +488,6 @@ def detect_syntax(command: str, cfg: dict):
     return "host", "native-or-powershell"
 
 
-def classify_command(command: str, cfg: dict, *, bash, cmd) -> RouteDecision:
-    """Choose a shell only when syntax identifies it with high confidence."""
-    kind, reason = detect_syntax(command, cfg)
-    if kind == "bash":
-        if bash:
-            return RouteDecision("git-bash", f"bash-syntax:{reason}")
-        return RouteDecision("host", f"bash-unavailable:{reason}")
-    if kind == "cmd":
-        if cmd:
-            return RouteDecision("cmd", f"cmd-syntax:{reason}")
-        return RouteDecision("host", f"cmd-unavailable:{reason}")
-    return RouteDecision("host", reason)
-
-
 # --------------------------------------------------------------------------
 # Rewrites that stay in the PowerShell host
 # --------------------------------------------------------------------------
@@ -610,6 +609,12 @@ _SELECT = re.compile(r"\|\s*(?:Select-Object|select)\b(?P<args>[^|]*)", re.I)
 _SELECT_VALUE_PARAMS = {"-first", "-last", "-skip", "-skiplast", "-index"}
 _SELECT_FLAG_PARAMS = {"-unique", "-wait"}
 _PSOBJECT = re.compile(r"\[pscustomobject\]\s*@\{|New-Object\s+(?:-TypeName\s+)?PSObject", re.I)
+# Parsed records print as a table when they have four or fewer properties.
+_RECORD_SOURCE = re.compile(
+    r"(?:^|[\n;|{])[ \t]*(?:ConvertFrom-Json|ConvertFrom-Csv|Import-Csv|Invoke-RestMethod|irm)(?![\w-])",
+    re.I,
+)
+_KEEPS_RECORDS = re.compile(r"^\s*(?:(?:Where-Object|where|Sort-Object|sort)\b|\?(?=[\s{]))", re.I)
 _OBJECT_SINK = re.compile(
     r"\|\s*(?:Format-\w+|Out-\w+|Write-\w+|Set-Content|Add-Content|Export-\w+|"
     r"ConvertTo-\w+|Tee-Object|Select-String|Join-String)\b|"
@@ -617,7 +622,7 @@ _OBJECT_SINK = re.compile(
     re.I,
 )
 _SCRIPT_LEVEL = re.compile(r"(?im)^[ \t]*(?:using\s+(?:namespace|module|assembly)\b|param\s*\()")
-_ASSIGNMENT = re.compile(r"^\s*(?:\[[^\]]+\]\s*)*\$[\w:{}]+(?:\[[^\]]*\])?\s*(?:[-+*/%]|\?\?)?=")
+_ASSIGNMENT = re.compile(r"^\s*(?:\[[^\]]*\]\s*)*\$[\w:{}]+(?:\[[^\]]*\])?\s*(?:[-+*/%]|\?\?)?=")
 
 
 def _select_property_count(args: str) -> int:
@@ -654,13 +659,59 @@ def _statement_buffers_table(statement: str) -> bool:
         count = _select_property_count(match.group("args"))
         if 1 <= count <= 4:
             return True
-    return bool(_PSOBJECT.search(statement))
+    return bool(_PSOBJECT.search(statement)) or _prints_records(statement)
+
+
+# A block after these runs as statements (`try {`, `if (…) {`, `& {`); one
+# after a command name (`ForEach-Object {`) is an argument.
+_BODY_OPENER = re.compile(r"(?:[)\]]|\b(?:try|catch|finally|else|do)|(?:^|\s)[&.])$", re.I)
+
+
+def _opens_body(out: list[str], start: int) -> bool:
+    # Only the text just before the brace matters; joining the whole prefix
+    # at every brace would make long statements quadratic.
+    return bool(_BODY_OPENER.search("".join(out[max(0, start - 64) : start]).rstrip()))
+
+
+def _statement_parts(statement: str) -> list[str]:
+    """The statement and the block bodies it runs, each with nested groups emptied."""
+    out: list[str] = []
+    openers: list[int] = []
+    parts: list[str] = []
+    for c in statement:
+        if c in "({[":
+            openers.append(len(out))
+        elif c in ")}]" and openers:
+            start = openers.pop()
+            if c == "}" and _opens_body(out, start):
+                parts.append("".join(out[start + 1 :]))
+            del out[start + 1 :]
+        out.append(c)
+    # Statements split at `;` and line breaks, so a block often stays open.
+    bounds = openers + [len(out)]
+    parts.append("".join(out[: bounds[0]]))
+    for start, end in zip(bounds, bounds[1:]):
+        if out[start] == "{" and _opens_body(out, start):
+            parts.append("".join(out[start + 1 : end]))
+    return parts
+
+
+def _prints_records(statement: str) -> bool:
+    # `$j = … | ConvertFrom-Json`, `(… | ConvertFrom-Json).name` and
+    # `… | ConvertFrom-Json | ForEach-Object { … }` print no records.
+    for code in _statement_parts(statement):
+        match = _RECORD_SOURCE.search(code)
+        if not match or _ASSIGNMENT.match(code):
+            continue
+        if all(_KEEPS_RECORDS.match(stage) for stage in code[match.end() :].split("|")[1:]):
+            return True
+    return False
 
 
 def needs_flush_guard(command: str) -> bool:
     """Would PowerShell lose this command's output when the script calls exit?"""
     masked = code_mask(command)
-    if "|" not in masked and not _PSOBJECT.search(masked):
+    if "|" not in masked and not _PSOBJECT.search(masked) and not _RECORD_SOURCE.search(masked):
         return False
     # `using` and `param` are only legal at the top of a script, not in a block.
     if _SCRIPT_LEVEL.search(masked):
@@ -872,7 +923,7 @@ def rewrite_command(cmd: str, cfg: dict | None = None) -> str:
         return wrap_cmd(plan.command, plan.executable)
     if plan.shell == "powershell7":
         return wrap_pwsh(plan.command, plan.executable, cfg)
-    return prepend_utf8(plan.command, cfg)
+    return prepend_utf8(plan.command, cfg, force=host_is_windows_powershell())
 
 
 def run_command(cmd: str, cfg: dict | None = None) -> int:
@@ -922,7 +973,8 @@ def run_command(cmd: str, cfg: dict | None = None) -> int:
 
 def extract_command(payload: dict):
     tool = str(payload.get("tool_name") or payload.get("toolName") or "")
-    if tool and tool.lower().split(".")[-1] not in {"shell", "bash", "powershell"}:
+    # Claude Code's Bash tool already runs in Git Bash; PowerShell rewrites would break it.
+    if tool and tool.lower().split(".")[-1] not in {"shell", "powershell"}:
         return None, ""
     tool_input = payload.get("tool_input") or payload.get("toolInput")
     if isinstance(tool_input, str):

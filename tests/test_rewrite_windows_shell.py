@@ -18,6 +18,16 @@ sys.path.insert(0, str(ROOT / "src"))
 
 import rewrite_windows_shell as shell
 
+REAL_HOST_IS_WINDOWS_POWERSHELL = shell.host_is_windows_powershell
+
+
+def setUpModule() -> None:
+    # Run from Windows PowerShell, every rewrite would gain the UTF-8 prefix.
+    patcher = patch.object(shell, "host_is_windows_powershell", return_value=False)
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
+
+
 BASH = Path(r"C:\Program Files\Git\bin\bash.exe")
 CMD = Path(r"C:\Windows\System32\cmd.exe")
 PWSH = Path(r"C:\Program Files\PowerShell\7\pwsh.exe")
@@ -39,6 +49,16 @@ def config(**overrides: object) -> dict:
     return value
 
 
+def route(command: str, cfg: dict, *, bash=BASH, cmd=CMD):
+    """Plan a command on a PowerShell 7 host with the given shells installed."""
+    with (
+        patch.object(shell, "find_git_bash", return_value=bash),
+        patch.object(shell, "find_cmd", return_value=cmd),
+        patch.object(shell, "host_is_powershell7", return_value=True),
+    ):
+        return shell.plan_command(command, cfg)
+
+
 class RoutingTests(unittest.TestCase):
     def test_routes_clear_bash_syntax_to_git_bash(self) -> None:
         command = "export NAME=agent\nprintf '%s\\n' \"$NAME\""
@@ -52,7 +72,7 @@ class RoutingTests(unittest.TestCase):
         wrapper.assert_called_once_with(command, BASH)
 
     def test_routes_bash_shebang_before_comment_masking(self) -> None:
-        decision = shell.classify_command(
+        decision = route(
             "#!/usr/bin/env bash\nprintf 'hello\\n'",
             config(autoRouteBash=True),
             bash=BASH,
@@ -73,7 +93,7 @@ class RoutingTests(unittest.TestCase):
         wrapper.assert_called_once_with(command, CMD)
 
     def test_percent_encoded_url_does_not_route_to_cmd(self) -> None:
-        decision = shell.classify_command(
+        decision = route(
             "curl.exe https://example.com/a%20b%2Fc",
             config(autoRouteCmd=True),
             bash=None,
@@ -82,14 +102,14 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(decision.shell, "host")
 
     def test_closed_percent_variable_routes_to_cmd(self) -> None:
-        decision = shell.classify_command(
+        decision = route(
             "echo %PATH%", config(autoRouteCmd=True), bash=None, cmd=CMD
         )
         self.assertEqual(decision.shell, "cmd")
         self.assertEqual(decision.reason, "cmd-syntax:percent-variable")
 
     def test_batch_for_variable_routes_to_cmd(self) -> None:
-        decision = shell.classify_command(
+        decision = route(
             "for %%F in (*.txt) do echo %%F",
             config(autoRouteCmd=True),
             bash=None,
@@ -161,13 +181,13 @@ class RoutingTests(unittest.TestCase):
         wrapper.assert_not_called()
 
     def test_nested_destructive_commands_stay_in_host(self) -> None:
-        bash_case = shell.classify_command(
+        bash_case = route(
             "if true; then rm -rf build; fi",
             config(autoRouteBash=True),
             bash=BASH,
             cmd=None,
         )
-        cmd_case = shell.classify_command(
+        cmd_case = route(
             "if exist build (rd /s /q build)",
             config(autoRouteCmd=True),
             bash=None,
@@ -188,7 +208,7 @@ class RoutingTests(unittest.TestCase):
             'export A="$(rm -rf build)"',
             "@echo off\necho it's\nrd /s /q build",
         ):
-            decision = shell.classify_command(
+            decision = route(
                 command,
                 config(wrapHeredoc=True, autoRouteBash=True, autoRouteCmd=True),
                 bash=BASH,
@@ -209,21 +229,27 @@ class RoutingTests(unittest.TestCase):
             "export A=1; truncate -s 0 f",
             "export A=1; shred -u f",
             "export A=1; unlink f",
+            "export A=1; rsync -a --delete src/ dst/",
             "@echo off\n%COMSPEC% /c rd /s /q build",
             "@echo off\nformat D: /q",
+            "@echo off\nrobocopy src dst /MIR",
+            "@echo off\nrobocopy src dst /E /PURGE",
+            "@echo off\nreg delete HKCU\\Software\\X /f",
+            "@echo off\nsc.exe delete svc",
+            "@echo off\nschtasks /Delete /TN x /F",
         ):
-            decision = shell.classify_command(
+            decision = route(
                 command, config(autoRouteBash=True, autoRouteCmd=True), bash=BASH, cmd=CMD
             )
             self.assertEqual(decision.shell, "host", command)
 
     def test_commit_message_words_do_not_block_a_heredoc(self) -> None:
         command = "git commit -m \"$(cat <<'EOF'\nfeat: format tables, truncate long names\nEOF\n)\""
-        decision = shell.classify_command(command, config(wrapHeredoc=True), bash=BASH, cmd=CMD)
+        decision = route(command, config(wrapHeredoc=True), bash=BASH, cmd=CMD)
         self.assertEqual((decision.shell, decision.reason), ("git-bash", "bash-syntax:heredoc"))
 
     def test_powershell_modulo_is_not_a_batch_variable(self) -> None:
-        decision = shell.classify_command(
+        decision = route(
             "foreach ($i in 1..10) { if ($i%2) { echo $i } }",
             config(autoRouteCmd=True),
             bash=None,
@@ -241,13 +267,21 @@ class RoutingTests(unittest.TestCase):
         for command in (
             "@'\n" + body + "\n'@ | Set-Content big.txt",
             "cat > big.txt <<'EOF'\n" + body + "\nEOF",
+            "echo " + "[[ x " * 20000,
+            "Get-Content x | " + "ForEach-Object { try { $_ } catch { } } | " * 5000 + "Sort-Object",
         ):
             start = time.perf_counter()
             shell.plan_command(command, settings)
             self.assertLess(time.perf_counter() - start, 1.0)
 
+    def test_double_brackets_need_bash_spacing(self) -> None:
+        bash_case = route("[[ -f setup.sh ]] && echo yes", config(autoRouteBash=True))
+        self.assertEqual(bash_case.reason, "bash-syntax:double-brackets")
+        generic = route("$t = [Dictionary[[string],[int]]]", config(autoRouteBash=True))
+        self.assertEqual(generic.shell, "host")
+
     def test_source_routes_to_git_bash(self) -> None:
-        decision = shell.classify_command(
+        decision = route(
             "source scripts/setup.sh", config(autoRouteBash=True), bash=BASH, cmd=None
         )
         self.assertEqual(decision.shell, "git-bash")
@@ -308,7 +342,7 @@ class HeredocTests(unittest.TestCase):
             "fix: keep Get-Item and $env:PATH out of the way\n"
             "EOF\n)\""
         )
-        decision = shell.classify_command(
+        decision = route(
             command, config(wrapHeredoc=True), bash=BASH, cmd=None
         )
         self.assertEqual(decision.shell, "git-bash")
@@ -324,14 +358,14 @@ class HeredocTests(unittest.TestCase):
             # A drive-letter path with backslashes is garbage to bash.
             "cd C:\\Users\\me\\repo; git add a.md; git commit -m \"$(cat <<'EOF'\nmsg\nEOF\n)\"",
         ):
-            decision = shell.classify_command(
+            decision = route(
                 command, config(wrapHeredoc=True), bash=BASH, cmd=None
             )
             self.assertEqual(decision.shell, "host", command)
 
     def test_destructive_command_next_to_a_heredoc_stays_in_host(self) -> None:
         command = "cat <<'EOF' > notes.txt\nhello\nEOF\nrm -rf build"
-        decision = shell.classify_command(
+        decision = route(
             command, config(wrapHeredoc=True), bash=BASH, cmd=None
         )
         self.assertEqual(decision.shell, "host")
@@ -339,13 +373,13 @@ class HeredocTests(unittest.TestCase):
 
     def test_powershell_here_string_with_heredoc_text_stays_in_host(self) -> None:
         command = "@'\nit's a note about <<EOF and Get-Item\n'@ | Set-Content note.txt"
-        decision = shell.classify_command(
+        decision = route(
             command, config(wrapHeredoc=True), bash=BASH, cmd=None
         )
         self.assertEqual(decision.shell, "host")
 
     def test_heredoc_routing_can_be_disabled(self) -> None:
-        decision = shell.classify_command(
+        decision = route(
             "cat <<'EOF'\nx\nEOF", config(wrapHeredoc=False), bash=BASH, cmd=None
         )
         self.assertEqual(decision.shell, "host")
@@ -516,6 +550,16 @@ class FlushGuardTests(unittest.TestCase):
         "Get-ChildItem | Select-Object Name; git status",
         'Get-Item C:\\Windows | Select-Object Name, Mode; cmd /c "exit 0" && Write-Output ok',
         "rg -n x . | Select-Object -First 5; Get-ChildItem | Select-Object Name",
+        "'{\"a\":1}' | ConvertFrom-Json",
+        "Get-Content x.csv | ConvertFrom-Csv; Write-Output done",
+        "Import-Csv users.csv",
+        "Invoke-RestMethod https://api.example.com/items",
+        "irm https://api.example.com/items; git status",
+        "irm https://api.example.com/items | Where-Object id -gt 3 | Sort-Object name",
+        "try { irm https://api.example.com/items } catch { $_ }",
+        "git status\nirm https://api.example.com/items",
+        "if ($ok) { Import-Csv a.csv | Where-Object { $_.ok } } else { 'none' }",
+        "foreach ($u in 'a', 'b') {\n  irm https://x/$u\n}",
     )
     SAFE = (
         "git status --short",
@@ -533,6 +577,19 @@ class FlushGuardTests(unittest.TestCase):
         "Get-ChildItem | Select-Object -First 3",
         "using namespace System.IO\nGet-ChildItem | Select-Object Name",
         "param($p)\nGet-ChildItem | Select-Object Name",
+        "$items = irm https://api.example.com/items",
+        "try { $j = $body | ConvertFrom-Json } catch { }",
+        "foreach ($e in 1, 2) { [int]$n = (irm https://x/$e).count }",
+        "(Get-Content x.json -Raw | ConvertFrom-Json).data.id -join ','",
+        "irm https://api.example.com/items | ForEach-Object { $_.name }",
+        "Get-Content x | ForEach-Object { $_ | ConvertFrom-Json } | Group-Object { $_.id }",
+        "Import-Csv a.csv | Where-Object { $_.ok } | ForEach-Object { $_.name }",
+        "foreach ($t in 1, 2) { $l = Get-Content x | ForEach-Object { $_ | ConvertFrom-Json }",
+        "irm https://api.example.com/items | Out-Null",
+        "irm https://api.example.com/items | ConvertTo-Json -Depth 5",
+        "Get-Content x.json -Raw | ConvertFrom-Json | Format-List",
+        "git log --grep=ConvertFrom-Json",
+        "Write-Output 'irm https://x | ConvertFrom-Json'",
     )
 
     def test_flags_commands_that_would_lose_a_table(self) -> None:
@@ -598,6 +655,13 @@ class FlushGuardEndToEndTests(unittest.TestCase):
 
     def test_table_survives_the_trailing_exit(self) -> None:
         command = "[pscustomobject]@{Alpha=1;Beta=2}; Write-Output done"
+        self.assertTrue(shell.needs_flush_guard(command))
+        result = self.run_script(shell.flush_guarded(command))
+        self.assertIn("Alpha", result.stdout)
+        self.assertIn("done", result.stdout)
+
+    def test_parsed_json_survives_the_trailing_exit(self) -> None:
+        command = "'{\"Alpha\":1,\"Beta\":2}' | ConvertFrom-Json; Write-Output done"
         self.assertTrue(shell.needs_flush_guard(command))
         result = self.run_script(shell.flush_guarded(command))
         self.assertIn("Alpha", result.stdout)
@@ -719,6 +783,23 @@ class WrapperTests(unittest.TestCase):
         for expensive in ("InputEncoding", "chcp", "PSNativeCommandUseErrorActionPreference"):
             self.assertNotIn(expensive, prefixed)
 
+    def test_windows_powershell_host_is_read_from_module_path(self) -> None:
+        for first, expected in (
+            ("C:\\Users\\me\\Documents\\WindowsPowerShell\\Modules", True),
+            ("C:\\Users\\me\\OneDrive\\Dokumente\\WindowsPowerShell\\Modules\\", True),
+            ("C:\\Users\\me\\Documents\\PowerShell\\Modules", False),
+            ("", False),
+        ):
+            value = first + ";C:\\Program Files\\WindowsPowerShell\\Modules"
+            with self.subTest(first=first), patch.dict(os.environ, {"PSModulePath": value}):
+                self.assertIs(REAL_HOST_IS_WINDOWS_POWERSHELL(), expected)
+
+    def test_windows_powershell_host_gets_utf8_setup(self) -> None:
+        # The kit profile is written for PowerShell 7 only.
+        with patch.object(shell, "host_is_windows_powershell", return_value=True):
+            actual = shell.rewrite_command("git status", config(utf8Prefix=False))
+        self.assertEqual(actual, shell.UTF8_PREFIX + "git status")
+
     def test_stale_wrapper_scripts_are_swept(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -801,7 +882,7 @@ class HookProtocolTests(unittest.TestCase):
     def test_claude_response_uses_hook_specific_output(self) -> None:
         payload = {
             "hook_event_name": "PreToolUse",
-            "tool_name": "Bash",
+            "tool_name": "PowerShell",
             "tool_input": {"command": "ls -la"},
             "transcript_path": "transcript.jsonl",
         }
@@ -810,6 +891,20 @@ class HookProtocolTests(unittest.TestCase):
         self.assertEqual(output["hookEventName"], "PreToolUse")
         self.assertEqual(output["updatedInput"]["command"], "Get-ChildItem -Force")
         self.assertNotIn("permission", response)
+
+    def test_claude_bash_tool_is_left_to_bash(self) -> None:
+        payload = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "ls -la && echo ok"},
+        }
+        stdout = io.StringIO()
+        with (
+            patch.object(sys, "stdin", io.TextIOWrapper(io.BytesIO(json.dumps(payload).encode()))),
+            patch.object(sys, "stdout", stdout),
+        ):
+            shell.hook_main()
+        self.assertEqual(json.loads(stdout.getvalue()), {})
 
     def test_non_shell_tool_is_ignored(self) -> None:
         tool_input, command = shell.extract_command(
@@ -837,6 +932,7 @@ class HookProcessTests(unittest.TestCase):
             env.pop("PYTHONUTF8", None)
             env.update(
                 {
+                    "PSModulePath": "C:\\Users\\me\\Documents\\PowerShell\\Modules",
                     "USERPROFILE": directory,
                     "AGENT_WINDOWS_SHELL_CONFIG": str(settings),
                 }
