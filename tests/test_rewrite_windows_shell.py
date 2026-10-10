@@ -177,6 +177,75 @@ class RoutingTests(unittest.TestCase):
             self.assertEqual(decision.shell, "host")
             self.assertEqual(decision.reason, "unsafe-command")
 
+    def test_destructive_command_hidden_from_the_mask_stays_in_host(self) -> None:
+        # An apostrophe or `$(` opens a PowerShell string or subexpression that
+        # hides the rest of the command from the masked text.
+        for command in (
+            "git commit -m \"$(cat <<'EOF'\nfix: don't drop rows\nEOF\n)\"\nrm -rf build",
+            "git commit -m \"$(cat <<'EOF'\nfix (see #12\nEOF\n)\" && rm -rf build",
+            "export A=1\necho it's\nrm -rf build",
+            "set -e\necho ${#arr[@]}; rm -rf build",
+            'export A="$(rm -rf build)"',
+            "@echo off\necho it's\nrd /s /q build",
+        ):
+            decision = shell.classify_command(
+                command,
+                config(wrapHeredoc=True, autoRouteBash=True, autoRouteCmd=True),
+                bash=BASH,
+                cmd=CMD,
+            )
+            self.assertEqual((decision.shell, decision.reason), ("host", "unsafe-command"), command)
+
+    def test_wrapped_or_unlisted_destructive_commands_stay_in_host(self) -> None:
+        for command in (
+            "export A=1; { rm -rf build; }",
+            "export A=1; env rm -rf build",
+            "export A=1; ls | xargs -0 rm",
+            "export A=1; `rm -rf build`",
+            "export A=1; bash -c 'rm -rf build'",
+            "export A=1; /bin/rm -rf build",
+            "export A=1; find . -name x -delete",
+            "export A=1; git clean -fdx",
+            "export A=1; truncate -s 0 f",
+            "export A=1; shred -u f",
+            "export A=1; unlink f",
+            "@echo off\n%COMSPEC% /c rd /s /q build",
+            "@echo off\nformat D: /q",
+        ):
+            decision = shell.classify_command(
+                command, config(autoRouteBash=True, autoRouteCmd=True), bash=BASH, cmd=CMD
+            )
+            self.assertEqual(decision.shell, "host", command)
+
+    def test_commit_message_words_do_not_block_a_heredoc(self) -> None:
+        command = "git commit -m \"$(cat <<'EOF'\nfeat: format tables, truncate long names\nEOF\n)\""
+        decision = shell.classify_command(command, config(wrapHeredoc=True), bash=BASH, cmd=CMD)
+        self.assertEqual((decision.shell, decision.reason), ("git-bash", "bash-syntax:heredoc"))
+
+    def test_powershell_modulo_is_not_a_batch_variable(self) -> None:
+        decision = shell.classify_command(
+            "foreach ($i in 1..10) { if ($i%2) { echo $i } }",
+            config(autoRouteCmd=True),
+            bash=None,
+            cmd=CMD,
+        )
+        self.assertEqual(decision.shell, "host")
+
+    def test_planning_time_grows_linearly_with_length(self) -> None:
+        # The hook times out after 10 s. Masked strings keep their line breaks,
+        # so an anchored \s* that rescans them makes long commands quadratic.
+        body = "\n".join(f"line {i} it's" for i in range(5000))
+        settings = config(
+            wrapHeredoc=True, autoRouteBash=True, autoRouteCmd=True, flushImplicitOutput=True
+        )
+        for command in (
+            "@'\n" + body + "\n'@ | Set-Content big.txt",
+            "cat > big.txt <<'EOF'\n" + body + "\nEOF",
+        ):
+            start = time.perf_counter()
+            shell.plan_command(command, settings)
+            self.assertLess(time.perf_counter() - start, 1.0)
+
     def test_source_routes_to_git_bash(self) -> None:
         decision = shell.classify_command(
             "source scripts/setup.sh", config(autoRouteBash=True), bash=BASH, cmd=None
@@ -196,7 +265,7 @@ class RoutingTests(unittest.TestCase):
         self.assertTrue(actual["commandChanged"])
         self.assertEqual(actual["changes"], ["safe-aliases"])
 
-    def test_bash_missing_does_not_resolve_cmd_or_pwsh(self) -> None:
+    def test_native_command_resolves_no_executables(self) -> None:
         # Resolving executables only when a route needs them keeps the hook cheap.
         with (
             patch.object(shell, "find_git_bash") as bash,
@@ -408,11 +477,28 @@ class HostAwareWrapTests(unittest.TestCase):
             with patch.object(shell, "parent_process_name", return_value=name):
                 self.assertIs(shell.host_is_powershell7(), expected)
 
-    def test_parent_process_lookup_is_safe(self) -> None:
-        name = shell.parent_process_name()
-        self.assertTrue(name is None or isinstance(name, str))
-        if os.name == "nt":
-            self.assertTrue(name)
+    @unittest.skipUnless(os.name == "nt", "Windows only")
+    def test_parent_process_lookup_names_the_launching_shell(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            probe = Path(directory) / "probe.py"
+            probe.write_text(
+                "import sys; sys.path.insert(0, sys.argv[1]);"
+                "import rewrite_windows_shell as r; print(r.parent_process_name())",
+                encoding="utf-8",
+            )
+            launcher = Path(directory) / "launch.ps1"
+            launcher.write_text("& $args[0] $args[1] $args[2]", encoding="utf-8")
+            completed = subprocess.run(
+                [
+                    str(shell.find_windows_powershell()), "-NoProfile", "-NonInteractive",
+                    "-ExecutionPolicy", "Bypass", "-File", str(launcher),
+                    sys.executable, str(probe), str(ROOT / "src"),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        self.assertEqual(completed.stdout.strip(), "powershell.exe", completed.stderr)
 
 
 class FlushGuardTests(unittest.TestCase):
@@ -470,13 +556,28 @@ class FlushGuardTests(unittest.TestCase):
         plan = shell.plan_command(command, config(flushImplicitOutput=False))
         self.assertEqual(plan.command, command)
 
-    def test_run_command_keeps_dollar_question_intact(self) -> None:
-        plan = shell.plan_command(
-            "Get-ChildItem | Select-Object Name",
-            config(flushImplicitOutput=True),
-            flush_guard=False,
-        )
-        self.assertNotIn("Out-Host", plan.command)
+    @unittest.skipUnless(PWSH.is_file(), "PowerShell 7 is not installed")
+    def test_run_command_reports_a_failure_after_a_table(self) -> None:
+        # The --run wrapper reads $?, which a flush guard would reset to success.
+        real_run = subprocess.run
+
+        def quiet(argv, **kwargs):
+            return real_run(argv, capture_output=True, **kwargs)
+
+        for command, expected in (
+            ("Get-ChildItem C:\\Windows | Select-Object -First 1 Name; Get-Item C:\\agent-missing-x", 1),
+            ("Get-ChildItem C:\\Windows | Select-Object -First 1 Name; cmd /c exit 7", 7),
+            ("Get-ChildItem C:\\Windows | Select-Object -First 1 Name", 0),
+        ):
+            with (
+                self.subTest(command=command),
+                tempfile.TemporaryDirectory() as directory,
+                patch.object(shell, "tmp_dir", return_value=Path(directory)),
+                patch("subprocess.run", side_effect=quiet),
+            ):
+                actual = shell.run_command(command, config(flushImplicitOutput=True))
+                self.assertEqual(actual, expected)
+                self.assertEqual(list(Path(directory).glob("agent-*")), [])
 
 
 @unittest.skipUnless(shutil.which("pwsh"), "PowerShell 7 is not installed")
@@ -570,21 +671,45 @@ class WrapperTests(unittest.TestCase):
                 shell.run_command("x", config(utf8Prefix=False))
         self.assertIn("[Console]::OutputEncoding=$utf8", seen["script"])
 
-    def test_pwsh_script_propagates_native_exit_code(self) -> None:
-        with (
-            patch.object(shell, "_write_temp_script") as writer,
-            patch.object(shell, "_wrapper", return_value="WRAPPED"),
-        ):
-            actual = shell.wrap_pwsh(
-                "cmd.exe /d /c exit 7 && Write-Output SHOULD_NOT_RUN", PWSH, config()
+    def run_wrapper_in_windows_powershell(self, wrapped: str) -> subprocess.CompletedProcess:
+        with tempfile.TemporaryDirectory() as directory:
+            host_script = Path(directory) / "host.ps1"
+            host_script.write_text(wrapped, encoding="utf-8-sig")
+            return subprocess.run(
+                [
+                    str(shell.find_windows_powershell()), "-NoProfile", "-NonInteractive",
+                    "-ExecutionPolicy", "Bypass", "-File", str(host_script),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
             )
-        self.assertEqual(actual, "WRAPPED")
-        body = writer.call_args.args[1]
-        self.assertTrue(body.startswith("$global:LASTEXITCODE = 0\n"))
-        self.assertIn("$agentShellSucceeded = $?", body)
-        self.assertIn("$agentShellNativeExit = $LASTEXITCODE", body)
-        self.assertEqual(body.count("exit $agentShellNativeExit"), 1)
-        self.assertIn("exit 1", body)
+
+    @unittest.skipUnless(PWSH.is_file(), "PowerShell 7 is not installed")
+    def test_pwsh_wrapper_keeps_chain_semantics_and_exit_code(self) -> None:
+        # What a Windows PowerShell 5.1 host runs for a command with `&&`.
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(shell, "tmp_dir", return_value=Path(directory)):
+                wrapped = shell.wrap_pwsh(
+                    "cmd.exe /d /c exit 7 && Write-Output SHOULD_NOT_RUN", PWSH, config()
+                )
+                result = self.run_wrapper_in_windows_powershell(wrapped)
+                leftovers = list(Path(directory).glob("agent-*"))
+        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertNotIn("SHOULD_NOT_RUN", result.stdout)
+        self.assertEqual(leftovers, [])
+
+    @unittest.skipUnless(CMD.is_file(), "cmd.exe not found")
+    def test_cmd_wrapper_propagates_exit_code(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(shell, "tmp_dir", return_value=Path(directory)):
+                result = self.run_wrapper_in_windows_powershell(
+                    shell.wrap_cmd("echo before\r\ncmd /c exit 9", CMD)
+                )
+                leftovers = list(Path(directory).glob("agent-*"))
+        self.assertEqual(result.returncode, 9, result.stderr)
+        self.assertIn("before", result.stdout)
+        self.assertEqual(leftovers, [])
 
     def test_utf8_prefix_is_lean_and_opt_in(self) -> None:
         self.assertEqual(shell.prepend_utf8("x", config(utf8Prefix=False)), "x")
@@ -746,6 +871,10 @@ class HookProcessTests(unittest.TestCase):
     def test_plain_command_is_left_alone(self) -> None:
         self.assertEqual(self.run_hook("git status --short"), {"permission": "allow"})
 
+    def test_internal_error_fails_open(self) -> None:
+        # A malformed setting makes planning raise; the command must still run.
+        self.assertEqual(self.run_hook("git status", internalHostPatterns=5), {"permission": "allow"})
+
     def test_invalid_payload_fails_open(self) -> None:
         completed = subprocess.run(
             [sys.executable, str(SCRIPT)],
@@ -763,7 +892,7 @@ class HookProcessTests(unittest.TestCase):
             "import rewrite_windows_shell as r;"
             "r.rewrite_command('git status --short', dict(r.DEFAULTS));"
             "r.rewrite_command('Get-ChildItem | Select-Object Name', dict(r.DEFAULTS));"
-            "heavy = ('argparse','subprocess','dataclasses','pathlib','tempfile','shutil','inspect','unittest');"
+            "heavy = ('argparse','subprocess','dataclasses','pathlib','tempfile','shutil','inspect','unittest','ctypes');"
             "print(','.join(m for m in heavy if m in sys.modules))"
         )
         completed = subprocess.run(

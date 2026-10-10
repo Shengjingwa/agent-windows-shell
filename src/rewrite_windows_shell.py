@@ -58,7 +58,10 @@ CommandPlan = namedtuple(
     defaults=((),),
 )
 
-COMMAND_PREFIX = r"(?P<prefix>(?:^|[;\n|{}()])\s*(?:&\s*)?)"
+# Anchored patterns use [ \t]* rather than \s*: masked strings keep their line
+# breaks, and \s* after a line anchor would rescan every following blank line,
+# which makes a long here-string quadratic. `\n` is in the anchor set instead.
+COMMAND_PREFIX = r"(?P<prefix>(?:^|[;\n|{}()])[ \t]*(?:&[ \t]*)?)"
 EXPLICIT_SHELL = re.compile(
     r"^\s*(?:&\s*)?(?P<shell>pwsh(?:\.exe)?|powershell(?:\.exe)?|"
     r"cmd(?:\.exe)?|bash(?:\.exe)?|sh(?:\.exe)?|wsl(?:\.exe)?)(?=\s|$)",
@@ -94,27 +97,33 @@ def _lazy(builder):
 
 
 def _build_unsafe():
+    # Searched in the raw command, not the mask: an apostrophe in a heredoc
+    # body opens a PowerShell string that would hide every later line, and
+    # wrappers (`env rm`, `xargs rm`, `bash -c 'rm …'`) put the verb anywhere.
+    # Matching too much only keeps a command in PowerShell, where it fails
+    # visibly instead of running.
     return re.compile(
-        r"(?:^|[;\n|&()]|\b(?:then|do|else|call)\s+)\s*(?:sudo\s+)?(?:"
-        r"rm|del|erase|rd|rmdir|format|diskpart|"
-        r"mkfs(?:\.[A-Za-z0-9]+)?|dd|shutdown|reboot"
-        r")\b",
-        re.I | re.M,
+        r"(?<![\w.$-])(?:rm|del|erase|rd|rmdir|diskpart|mkfs|dd|shutdown|"
+        r"reboot|shred|unlink)(?![\w-])"
+        # Commit messages say "format" and "truncate"; require the command form.
+        r"|(?<![\w.$-])format\s+(?:/\S+\s+)*[A-Za-z]:|(?<![\w.$-])truncate\s+-"
+        r"|(?<![\w-])-delete\b|\bgit\s+clean\b",
+        re.I,
     )
 
 
 def _build_bash_signatures():
     return (
         ("shebang", re.compile(r"^\s*#!\s*/(?:usr/bin/env\s+)?(?:ba|z|k)?sh\b", re.I)),
-        ("source", re.compile(r"(?:^|[;\n])\s*source\s+[^\s;]+", re.I)),
-        ("export", re.compile(r"(?:^|[;\n])\s*export\s+[A-Za-z_][A-Za-z0-9_]*=", re.I)),
-        ("set-options", re.compile(r"(?:^|[;\n])\s*set\s+-[a-zA-Z]*[euxo][a-zA-Z]*\b")),
+        ("source", re.compile(r"(?:^|[;\n])[ \t]*source\s+[^\s;]+", re.I)),
+        ("export", re.compile(r"(?:^|[;\n])[ \t]*export\s+[A-Za-z_][A-Za-z0-9_]*=", re.I)),
+        ("set-options", re.compile(r"(?:^|[;\n])[ \t]*set\s+-[a-zA-Z]*[euxo][a-zA-Z]*\b")),
         ("double-brackets", re.compile(r"\[\[.*?\]\]", re.S)),
         ("parameter-expansion", re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*(?::[-+=?])")),
         (
             "control-flow",
             re.compile(
-                r"(?:^|\n)\s*(?:if\b.*;\s*then|for\b.*;\s*do|while\b.*;\s*do|fi\b|done\b)",
+                r"(?:^|\n)[ \t]*(?:if\b.*;\s*then|for\b.*;\s*do|while\b.*;\s*do|fi\b|done\b)",
                 re.I,
             ),
         ),
@@ -125,8 +134,8 @@ def _build_bash_signatures():
 def _build_cmd_signatures():
     return (
         ("echo-off", re.compile(r"^\s*@echo\s+off\b", re.I)),
-        ("setlocal", re.compile(r"(?:^|[&\n])\s*(?:setlocal|endlocal)\b", re.I)),
-        ("set-variable", re.compile(r"(?:^|[&\n])\s*set\s+\"?[A-Za-z_][A-Za-z0-9_]*=", re.I)),
+        ("setlocal", re.compile(r"(?:^|[&\n])[ \t]*(?:setlocal|endlocal)\b", re.I)),
+        ("set-variable", re.compile(r"(?:^|[&\n])[ \t]*set\s+\"?[A-Za-z_][A-Za-z0-9_]*=", re.I)),
         (
             "percent-variable",
             re.compile(
@@ -136,11 +145,11 @@ def _build_cmd_signatures():
         ),
         (
             "for-variable",
-            re.compile(r"(?:^|[&\n])\s*for(?:\s+/[A-Za-z]+)*\s+%{1,2}[A-Za-z]\b", re.I),
+            re.compile(r"(?:^|[&\n])[ \t]*for(?:\s+/[A-Za-z]+)*\s+%{1,2}[A-Za-z]\b", re.I),
         ),
-        ("if-errorlevel", re.compile(r"(?:^|[&\n])\s*if\s+(?:not\s+)?errorlevel\b", re.I)),
-        ("for-f", re.compile(r"(?:^|[&\n])\s*for\s+/f\b", re.I)),
-        ("label", re.compile(r"(?:^|\n)\s*:[A-Za-z_][A-Za-z0-9_.-]*\s*$", re.M)),
+        ("if-errorlevel", re.compile(r"(?:^|[&\n])[ \t]*if\s+(?:not\s+)?errorlevel\b", re.I)),
+        ("for-f", re.compile(r"(?:^|[&\n])[ \t]*for\s+/f\b", re.I)),
+        ("label", re.compile(r"(?:^|\n)[ \t]*:[A-Za-z_][A-Za-z0-9_.-]*[ \t]*\r?$", re.M)),
     )
 
 
@@ -271,47 +280,27 @@ def parent_process_name() -> str | None:
         import ctypes
         from ctypes import wintypes
 
-        class ProcessEntry(ctypes.Structure):
-            _fields_ = [
-                ("dwSize", wintypes.DWORD),
-                ("cntUsage", wintypes.DWORD),
-                ("th32ProcessID", wintypes.DWORD),
-                ("th32DefaultHeapID", ctypes.c_size_t),
-                ("th32ModuleID", wintypes.DWORD),
-                ("cntThreads", wintypes.DWORD),
-                ("th32ParentProcessID", wintypes.DWORD),
-                ("pcPriClassBase", ctypes.c_long),
-                ("dwFlags", wintypes.DWORD),
-                ("szExeFile", ctypes.c_wchar * 260),
-            ]
-
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        entry_pointer = ctypes.POINTER(ProcessEntry)
-        kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
-        kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
-        kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, entry_pointer]
-        kernel32.Process32FirstW.restype = wintypes.BOOL
-        kernel32.Process32NextW.argtypes = [wintypes.HANDLE, entry_pointer]
-        kernel32.Process32NextW.restype = wintypes.BOOL
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.QueryFullProcessImageNameW.argtypes = [
+            wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)
+        ]
+        kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
         kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-        snapshot = kernel32.CreateToolhelp32Snapshot(0x2, 0)
-        if not snapshot or snapshot == wintypes.HANDLE(-1).value:
+        # The hook's PowerShell waits for this process, so the id is still its own.
+        process_query_limited_information = 0x1000
+        handle = kernel32.OpenProcess(process_query_limited_information, False, os.getppid())
+        if not handle:
             return None
         try:
-            entry = ProcessEntry()
-            entry.dwSize = ctypes.sizeof(ProcessEntry)
-            names = {}
-            parent = None
-            me = os.getpid()
-            more = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
-            while more:
-                names[entry.th32ProcessID] = entry.szExeFile.lower()
-                if entry.th32ProcessID == me:
-                    parent = entry.th32ParentProcessID
-                more = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
-            return names.get(parent)
+            size = wintypes.DWORD(32768)
+            buffer = ctypes.create_unicode_buffer(size.value)
+            if not kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+                return None
+            return os.path.basename(buffer.value).lower()
         finally:
-            kernel32.CloseHandle(snapshot)
+            kernel32.CloseHandle(handle)
     except Exception:
         return None
 
@@ -429,10 +418,12 @@ def code_mask(text: str) -> str:
 
 
 _POWERSHELL_STATEMENT = re.compile(
-    r"(?m)^\s*\$[A-Za-z_]\w*\s*=(?!=)"  # `$x = 1` is not valid bash
-    r"|(?:^|[;\n|(])\s*&\s*[$\"'(]"  # `& $exe`, `& 'C:\\tool.exe'`
+    r"(?m)^[ \t]*\$[A-Za-z_]\w*\s*=(?!=)"  # `$x = 1` is not valid bash
+    r"|(?:^|[;\n|(])[ \t]*&\s*[$\"'(]"  # `& $exe`, `& 'C:\\tool.exe'`
 )
 _DRIVE_PATH = re.compile(r"\b[A-Za-z]:\\")
+# Batch has no `$name` variables; `$i%2` is PowerShell's modulo operator.
+_POWERSHELL_VARIABLE = re.compile(r"\$[A-Za-z_]")
 
 
 def _head_is_powershell(raw_head: str, masked_head: str) -> bool:
@@ -465,19 +456,19 @@ def detect_syntax(command: str, cfg: dict):
         line_end = masked.find("\n", opener.end())
         cut = len(masked) if line_end < 0 else line_end
         if not _head_is_powershell(command[:cut], masked[:cut]) and not (
-            unsafe_auto_route().search(masked)
+            unsafe_auto_route().search(command)
         ):
             return "bash", "heredoc"
     if POWERSHELL_SYNTAX.search(masked):
         return "host", "powershell-syntax"
-    if unsafe_auto_route().search(masked):
+    if unsafe_auto_route().search(command):
         return "host", "unsafe-command"
     if cfg.get("autoRouteBash"):
         for reason, pattern in bash_signatures():
             candidate = command if reason == "shebang" else masked
             if pattern.search(candidate):
                 return "bash", reason
-    if cfg.get("autoRouteCmd"):
+    if cfg.get("autoRouteCmd") and not _POWERSHELL_VARIABLE.search(masked):
         for reason, pattern in cmd_signatures():
             if pattern.search(masked):
                 return "cmd", reason
@@ -625,7 +616,7 @@ _OBJECT_SINK = re.compile(
     r"\|\s*&?\s*\S*\.exe\b|(?<![-<])>",
     re.I,
 )
-_SCRIPT_LEVEL = re.compile(r"(?im)^\s*(?:using\s+(?:namespace|module|assembly)\b|param\s*\()")
+_SCRIPT_LEVEL = re.compile(r"(?im)^[ \t]*(?:using\s+(?:namespace|module|assembly)\b|param\s*\()")
 _ASSIGNMENT = re.compile(r"^\s*(?:\[[^\]]+\]\s*)*\$[\w:{}]+(?:\[[^\]]*\])?\s*(?:[-+*/%]|\?\?)?=")
 
 
