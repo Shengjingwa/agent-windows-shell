@@ -98,10 +98,13 @@ Cursor 给每条 Shell 命令生成的脚本以 `exit $COMMAND_EXIT_CODE` 结尾
 | 多行管道 | 0 行 | 4 行 |
 | `Set-Location …; Get-ChildItem … \| Select-Object …; (Get-Location).Path` | 0 行 | 5 行 |
 | `Get-Date \| Select-Object Year, Month; "v=$v"` | 0 行 | 4 行 |
+| `'{"a":1,"b":2}' \| ConvertFrom-Json; Write-Output AFTER` | 0 行 | 表格和 `AFTER` 都在 |
+| `"a,b`n1,2" \| ConvertFrom-Csv; Write-Output AFTER` | 0 行 | 表格和 `AFTER` 都在 |
+| 5 个属性的 JSON 对象（按列表排版） | 都在 | 都在 |
 | 路径不存在（只有错误） | 5 行 | 5 行 |
 | 末尾自己写 `exit 3` | 0 行 | 0 行（退出码都是 3） |
 
-规则只在命令里有未收口的小表格时才包（`Select-Object` 带 1–4 个属性、`[pscustomobject]@{…}`；已经接了 `Format-Table`、`Out-String`、重定向或赋值的语句不算）。含不含 `git`、`py` 这类原生程序都包，因为 PowerShell 和原生程序混在一条命令里恰恰最常见：用这套规则重放 11,855 条历史命令，652 条（5.5%）会被包，其中 355 条纯 PowerShell，297 条混有原生程序。
+规则只在命令里有未收口的小表格时才包（`Select-Object` 带 1–4 个属性、`[pscustomobject]@{…}`；已经接了 `Format-Table`、`Out-String`、重定向或赋值的语句不算）。第二轮审查后补了一条：语句直接打印 `ConvertFrom-Json`、`ConvertFrom-Csv`、`Import-Csv`、`Invoke-RestMethod` 的结果时也包，后面只允许接 `Where-Object`、`Sort-Object` 这类不改变记录的阶段；赋值、`(…).name` 取属性、`ForEach-Object` 投影都不打印记录，不包。第一版只看命令名，重放时会多包 105 条（多数是 `foreach` 块里的 `$j = … | ConvertFrom-Json`）；按嵌套层次判断后，历史命令里没有一条因此被包，也没有找到漏掉的真实案例。含不含 `git`、`py` 这类原生程序都包，因为 PowerShell 和原生程序混在一条命令里恰恰最常见：用这套规则重放 11,855 条历史命令，652 条（5.5%）会被包，其中 355 条纯 PowerShell，297 条混有原生程序。
 
 包一层的代价是原生程序的输出改走 PowerShell 管道，不再直通控制台。本机实测（每组 7 次取中位数，原生输出由 Python 生成）：
 
@@ -164,7 +167,7 @@ Windows PowerShell 5.1 与较新 PowerShell 的默认文本编码不同；Window
 
 因此安装器用 .NET API 写无 BOM UTF-8 JSON；Hook 读取配置和 Cursor 交来的 payload 时按 `utf-8-sig` 解码，带 BOM 的输入也能读。
 
-UTF-8 输出编码放在 profile 里。Cursor 的 Shell 工具启动 `pwsh.exe` 时不带 `-NoProfile`（见下一节），profile 会加载，所以只需在 profile 里设一次，不必在每条命令前重复。Hook 的命令前缀（`utf8Prefix`）默认关闭，只对 `-NoProfile` 启动的子 shell（Hook 的 PowerShell 7 包装、`--run`）强制加。profile 里不再设 `chcp 65001` 和 `Console.InputEncoding`：前者要多启动一个子进程，后者没有找到对应的乱码证据（随机 300 条里编码类 2 条，都不是高置信；参照的 268 条里 11 条，高置信 1 条）。
+UTF-8 输出编码放在 profile 里。Cursor 的 Shell 工具启动 `pwsh.exe` 时不带 `-NoProfile`（见下一节），profile 会加载，所以只需在 profile 里设一次，不必在每条命令前重复。Hook 的命令前缀（`utf8Prefix`）默认关闭，只对 `-NoProfile` 启动的子 shell（Hook 的 PowerShell 7 包装、`--run`）和 Windows PowerShell 5.1 宿主（profile 块只写给 PowerShell 7）强制加。profile 里不再设 `chcp 65001` 和 `Console.InputEncoding`：前者要多启动一个子进程，后者没有找到对应的乱码证据（随机 300 条里编码类 2 条，都不是高置信；参照的 268 条里 11 条，高置信 1 条）。
 
 来源：
 
@@ -258,7 +261,15 @@ Hook 不处理以下情况：
 已验证：
 
 - 交付前的独立审查（Opus）发现两处由这一轮改动带来的回归，都已修复：一是 heredoc 正文里的撇号让后面的 `rm -rf` 逃过危险命令检查、被送进 Git Bash 执行；二是锚点后的 `\s*` 让长命令的规划时间按平方增长。第一处审查在隔离目录里复现了真删除。同一份审查指出的旧问题也一并修了：包装器里的删除命令（`env rm` 等 20 种写法）、PowerShell 取模被当成批处理变量、宿主检测每次要枚举全部进程（约 27 ms，改为直接查父进程，约 0.1 ms）、安装器的 6 处边角问题（非 UTF-8 profile 被改写成乱码、5.1 下 `py` 写 stderr 会中断安装、只装 `-Cursor` 时删掉了旧 profile 块依赖的配置、手改过的旧 profile 块会重复、行尾 `//` 注释在 PowerShell 7 下被丢掉、技能路径是文件符号链接时安装中断）。修复后用 11,855 条历史命令重放，只有 4 条的原因标签从 `native-or-powershell` 变成 `unsafe-command`，路由和改写都没变；规划全部命令的总耗时从 22.4 秒降到 10.7 秒。
-- 78/78 Python 单元测试通过，其中包括：用带 BOM 的 payload 起真实子进程跑 Hook；常见路径不导入 `argparse`、`subprocess`、`dataclasses` 等重模块；PowerShell 7 / 5.1 / 未知宿主的包装分支；输出丢失保护的判定，以及用真实 `pwsh` 按 Cursor 的“命令 + `exit $LASTEXITCODE`”外壳跑一遍，确认表格、后续输出和原生程序的退出码 7 都还在；`session_start.py` 按注册表补齐 PATH 后再判断 `python`；审查发现的每个问题各有一条测试，另外用 10 个故意改坏的版本（审查里没被测试抓住的 6 个，加上把每项修复改回去）逐个跑，全部被测试抓到。
+- 第二轮独立审查（Opus，看最终 diff）没有发现阻断问题，提出 4 项应修，都已修复：
+  - 宿主是 Windows PowerShell 5.1 时 profile 块不加载，UTF-8 设置缺失。每次查父进程要多 16–21 ms，所以改看 `PSModulePath` 第一项：每个 PowerShell 都把自己的用户模块目录放在第一位，子进程继承。7 套 5.1、5.1 套 7、两种干净环境共 6 种组合实测都判对，耗时可以忽略。判成 5.1 时 Hook 给命令补 UTF-8 设置；判错只会多补一段无害的设置。
+  - 安装器按 `%USERPROFILE%\Documents` 找 profile，文档文件夹被 OneDrive 或策略重定向时写错位置。现在用文档文件夹的真实位置；`USERPROFILE` 被改到隔离目录时仍用隔离目录。
+  - `rsync --delete`、`robocopy /MIR`（及 `/PURGE`、`/MOVE`）、`reg delete`、`sc delete`、`schtasks /delete` 没有被当成危险命令。重放历史命令，只有 2 条的原因标签变了（`schtasks.exe /Delete /?` 和 `git push origin --delete`），路由不变。
+  - 直接打印 `ConvertFrom-Json` 等命令的结果时，输出同样会被吞（见“输出丢失”一节）。
+  - 小问题也一并修了：`[[ … ]]` 的匹配限定在一行 300 个字符以内，并要求内侧有空格（PowerShell 泛型 `List[[string]]` 不再被当成 Bash）；只给测试用的 `classify_command` 删掉，测试改走 `plan_command`。
+  - 查 Claude Code 官方文档时发现适配器有两处旧问题：Claude 在 Windows 上用 Git Bash 执行 shell 形式的 Hook 命令，而适配器写的是 PowerShell 的 `& "…"`；Bash 工具的命令也被送进来做 PowerShell 改写，`ls -la` 会变成 `Get-ChildItem`。现在改用 exec 形式（`command` + `args`，不经过 shell），只挂 PowerShell 工具，脚本也不再处理 Bash 工具的命令。这台机器没装 Claude Code，这条路径没有实机验证。
+  - 每项修复各有测试；把 14 处修复逐个改回去，测试都能抓到。其中一处是新判断自己带来的：最初每遇到一个 `}` 都把前面整段文本拼起来查，单条语句有几千个块时按平方增长（82 KB 要 8.8 秒）；改成只看块前面几十个字符后，150–490 KB 的单行命令 0.5–2.0 秒，随长度线性增长。
+- 83/83 Python 单元测试通过，其中包括：用带 BOM 的 payload 起真实子进程跑 Hook；常见路径不导入 `argparse`、`subprocess`、`dataclasses` 等重模块；PowerShell 7 / 5.1 / 未知宿主的包装分支；输出丢失保护的判定，以及用真实 `pwsh` 按 Cursor 的“命令 + `exit $LASTEXITCODE`”外壳跑一遍，确认表格、后续输出和原生程序的退出码 7 都还在；`session_start.py` 按注册表补齐 PATH 后再判断 `python`；审查发现的每个问题各有一条测试，另外用 10 个故意改坏的版本（审查里没被测试抓住的 6 个，加上把每项修复改回去）逐个跑，全部被测试抓到。
 - 装好后在 Cursor 里直接验证（2026-10-10）：`Get-ChildItem C:\Windows -Directory | Select-Object -First 3 Name` 输出了表格；一条同时含表格、`cmd /c` 和 `&&` 的命令，没加保护时只输出第一行，加上后表格和 `chain ok` 都在；表格加 `py -3 -c "…sys.exit(5)"` 的命令，Cursor 报告退出码 5。Hook 日志显示这条 `&&` 命令没有被包进 PowerShell 7 子进程，说明 Hook 进程认出了宿主是 `pwsh.exe`。
 - 用当前 profile 启动的新 `pwsh`，即使继承了只有 12 项的旧 `PATH`，也能找到 `python`、`node` 和 `gh`；Windows PowerShell 5.1 点源同一个文件也正常。
 - 用 11,855 条历史命令对比新旧路由：11,476 条结果相同；355 条（只算纯 PowerShell 命令，后来又放宽到含原生程序的命令，见上）只多了输出保护；21 条只是原因标签变了（字符串里的 `$(…)` 现在被识别为 PowerShell 语法）；3 条被改成 Bash heredoc，收紧命令头判断后只剩 2 条真正的 heredoc。没有异常。
@@ -277,7 +288,7 @@ Hook 不处理以下情况：
 - `%20`、`%2F` 等 URL 百分号编码不会误触发批处理路由；闭合 `%PATH%` 和 `for %%F` 仍能识别。
 - `then rm -rf` 和括号内 `rd /s /q` 等嵌套危险命令保持在宿主，不会因自动切换解释器而被激活。
 - Cursor stdin/stdout 返回 `updated_input`。
-- Claude Code stdin/stdout 返回 `hookSpecificOutput.updatedInput`。
+- Claude Code stdin/stdout 返回 `hookSpecificOutput.updatedInput`（单元测试验证格式；没有实机验证）。Bash 工具的调用原样放行。
 - PowerShell 5.1 隔离环境连续安装两次后，多 shell 配置写入成功，本项目 Hook 没有重复，生成 JSON 无 BOM。
 
 ## 后续建议

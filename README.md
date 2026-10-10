@@ -30,8 +30,8 @@ Set-Location <这个目录>
 | 开关 | 作用 |
 |------|------|
 | `-Cursor` | `~\.cursor\hooks.json` + 合并终端相关 settings（只在受管键有变化时才改写；文件里有注释或不是纯 JSON 时不动，只给出提示）；清掉旧版拷进 `~\.cursor\rules` 的规则文件（Cursor 不读那个目录） |
-| `-Claude` | 写入或提示合并 `~\.claude\settings.json`，并链接技能 |
-| `-Profile` | 在 PowerShell 7 profile 写 `# >>> agent-windows-shell` 块，直接点源 `src\profile.ps1`；重装会刷新这个块，块外内容不动；profile 不是 UTF-8 编码时不改，只提示 |
+| `-Claude` | 写入或提示合并 `~\.claude\settings.json`（只挂 PowerShell 工具，用 exec 形式启动 Python），并链接技能 |
+| `-Profile` | 在 PowerShell 7 profile（`文档\PowerShell`，跟随 OneDrive 等文档文件夹重定向）写 `# >>> agent-windows-shell` 块，直接点源 `src\profile.ps1`；重装会刷新这个块，块外内容不动；profile 不是 UTF-8 编码时不改，只提示 |
 | `-Skill` | 用 junction 把 `skills\windows-agent-shell` 链到 `~\.cursor\skills`，仓库更新即生效；不写 `~\.agents` |
 | `-Env` | 用户环境变量 UTF-8 / 工具包根目录 |
 | `-DisableCursorAttribution` | 关掉 Cursor CLI 的 Co-authored-by（IDE 里还要再关 Attribution） |
@@ -70,8 +70,8 @@ py -3 "$env:AGENT_WINDOWS_SHELL_ROOT\src\rewrite_windows_shell.py" --run 'export
 - `wrapHeredoc`（默认开）：检测到真实 bash heredoc 时，交给 Git Bash 执行
 - `autoRouteBash`（默认开）：识别到 `export`、`source`、`set -e`、`[[ ... ]]` 等明确 Bash 语法时，交给 Git Bash
 - `autoRouteCmd`（默认开）：识别到 `@echo off`、`setlocal`、`%VAR%` 等明确批处理语法时，交给 `cmd.exe /d`
-- `flushImplicitOutput`（默认开）：命令里有自动表格时（如 `Get-ChildItem | Select-Object Name`），包一层 `. { … } | Out-Host`，避免 Cursor 脚本末尾的 `exit` 把这些输出连同后面的输出一起吞掉；原生程序的输出会改走 PowerShell 管道，200 行约多 20 ms，20,000 行约多 1.2 s。改走管道后，原生输出按控制台编码解码，所以控制台要是 UTF-8（profile 或 `utf8Prefix` 负责），否则非 ASCII 字符会乱码
-- `utf8Prefix`（默认关）：每条命令前补一段 UTF-8 设置。正常情况下 profile 已经负责；宿主以 `-NoProfile` 启动，或没装 profile 块时才需要打开。只装 `-Cursor`、profile 里又没有本项目的块时，安装器会提示
+- `flushImplicitOutput`（默认开）：命令会打印自动表格时（如 `Get-ChildItem | Select-Object Name`，或直接打印 `ConvertFrom-Json`、`ConvertFrom-Csv`、`Import-Csv`、`Invoke-RestMethod` 的结果），包一层 `. { … } | Out-Host`，避免 Cursor 脚本末尾的 `exit` 把这些输出连同后面的输出一起吞掉。赋值（`$j = … | ConvertFrom-Json`）、取属性（`(…).name`）和 `ForEach-Object` 投影不打印记录，不包。包了之后原生程序的输出改走 PowerShell 管道，200 行约多 20 ms，20,000 行约多 1.2 s；原生输出按控制台编码解码，所以控制台要是 UTF-8（profile 或 `utf8Prefix` 负责），否则非 ASCII 字符会乱码
+- `utf8Prefix`（默认关）：每条命令前补一段 UTF-8 设置。profile 块只写给 PowerShell 7；宿主是 Windows PowerShell 5.1 时（看 `PSModulePath` 第一项是不是 `WindowsPowerShell\Modules`，不额外查进程），Hook 自动补这段，不用打开。宿主以 `-NoProfile` 启动的 PowerShell 7，或没装 profile 块时才需要打开。只装 `-Cursor`、profile 里又没有本项目的块时，安装器会提示
 
 改完不必重装。钩子每次启动会读这份文件。
 
@@ -100,7 +100,7 @@ Hook 只在高置信条件下切换解释器：
 - 路由扫描会屏蔽字符串、注释和 PowerShell here-string，避免把示例文本当成 shell 语法；双引号里的 `$( … )` 子表达式是代码，保持可见，所以 `git commit -m "$(cat <<'EOF' … EOF)"` 能被识别成 Bash。
 - heredoc 开头那一行出现 PowerShell 语法（`Set-Location …; & $py - <<'PY'`）时留在宿主，由 PowerShell 报出清楚的解析错误，而不是让 Git Bash 报 `command not found`。
 - URL 中的 `%20`、`%2F` 等百分号编码不会被当成批处理变量；闭合 `%VAR%`、参数变量和 `for` 变量仍可识别。
-- `rm`、`del`、`rd`、`diskpart`、`mkfs`、`dd`、`shutdown`、`shred`、`unlink`、`find -delete`、`git clean`、`format D:`、`truncate -s` 等命令不触发自动路由。这项检查看原始文本，命令词出现在任何位置都算（包括 `env rm`、`xargs rm`、heredoc 之后的行），宁可多拦。显式选择 shell 时仍尊重调用者意图。
+- `rm`、`del`、`rd`、`diskpart`、`mkfs`、`dd`、`shutdown`、`shred`、`unlink`、`find -delete`、`rsync --delete`、`git clean`、`robocopy /MIR`（及 `/PURGE`、`/MOVE`）、`reg delete`、`sc delete`、`schtasks /delete`、`format D:`、`truncate -s` 等命令不触发自动路由。这项检查看原始文本，命令词出现在任何位置都算，包括 `env rm`、`xargs rm`、heredoc 正文和 heredoc 之后的行，宁可多拦。所以提交信息里写了 `rm` 这样的词，`git commit -m "$(cat <<'EOF' …)"` 也会留在 PowerShell，由 PowerShell 报出解析错误；这时改用 `git commit --file`。显式选择 shell 时仍尊重调用者意图。
 
 路由后仍保留原有兼容处理：
 
@@ -119,4 +119,4 @@ Hook **不会**通过翻译或切换 shell 激活删除命令。删除命令需�
 
 ## 仍然修不了
 
-部分 IDE/agent 会自己生成临时 `.ps1`、使用 `-NoProfile`，并忽略集成终端的 `automationProfile`。Cursor 3.21.9 就是这样：Shell 工具和 Hook 都按 Cursor 进程自己的 `PATH` 找 `pwsh`，不读 `automationProfile`；Cursor 从常驻启动器（例如 uTools）打开时，这个 `PATH` 停在启动器启动那一刻，之后装的工具它看不到。`src\profile.ps1` 会给新开的对话补上缺的 PATH 目录，已经开着的对话保留原来的环境。规则和 Hook 能减少命令不兼容，但不能修复宿主产品的编码、PTY 或退出码实现。安装程序也不会开启系统级“使用 Unicode UTF-8”测试版区域设置，因为它可能破坏旧程序。
+部分 IDE/agent 会自己生成临时 `.ps1`、使用 `-NoProfile`，并忽略集成终端的 `automationProfile`。Cursor 3.21.9 就是这样：Shell 工具和 Hook 都按 Cursor 进程自己的 `PATH` 找 `pwsh`，不读 `automationProfile`；Cursor 从常驻启动器（例如 uTools）打开时，这个 `PATH` 停在启动器启动那一刻，之后装的工具它看不到。`src\profile.ps1` 会给新开的对话补上缺的 PATH 目录，已经开着的对话保留原来的环境。机器上没有 PowerShell 7 时，Cursor 改用 Windows PowerShell 5.1，本项目的 profile 块不会加载：UTF-8 设置由 Hook 补上，PATH 补齐没有。规则和 Hook 能减少命令不兼容，但不能修复宿主产品的编码、PTY 或退出码实现。安装程序也不会开启系统级“使用 Unicode UTF-8”测试版区域设置，因为它可能破坏旧程序。
