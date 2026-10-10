@@ -693,8 +693,9 @@ def extract_command(payload: dict) -> tuple[dict | None, str]:
 
 
 def is_claude_payload(payload: dict) -> bool:
-    event = str(payload.get("hook_event_name") or "")
-    return event == "PreToolUse" or "transcript_path" in payload
+    # Cursor payloads also carry transcript_path; only Claude Code sends the
+    # PascalCase event name.
+    return str(payload.get("hook_event_name") or "") == "PreToolUse"
 
 
 def hook_response(
@@ -720,7 +721,9 @@ def hook_response(
 
 
 def hook_main() -> None:
-    raw = sys.stdin.read()
+    # Cursor writes UTF-8 with a BOM; the default stdin decoder uses the ANSI
+    # code page unless PYTHONUTF8 is set for the hook process.
+    raw = sys.stdin.buffer.read().decode("utf-8-sig")
     try:
         payload = json.loads(raw or "{}")
     except json.JSONDecodeError:

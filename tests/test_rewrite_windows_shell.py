@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import sys
@@ -442,6 +443,57 @@ class HookProtocolTests(unittest.TestCase):
             "Get-ChildItem -Force",
         )
         self.assertNotIn("hookSpecificOutput", response)
+
+    def test_cursor_payload_with_transcript_path_uses_updated_input(self) -> None:
+        payload = {
+            "hook_event_name": "preToolUse",
+            "tool_name": "Shell",
+            "tool_input": {"command": "ls -la", "working_directory": "C:\\"},
+            "conversation_id": "conversation",
+            "generation_id": "generation",
+            "cursor_version": "3.23.0",
+            "transcript_path": "C:\\transcripts\\conversation.jsonl",
+        }
+        response = shell.hook_response(
+            payload,
+            payload["tool_input"],
+            "Get-ChildItem -Force",
+        )
+        self.assertEqual(response["permission"], "allow")
+        self.assertEqual(
+            response["updated_input"]["command"],
+            "Get-ChildItem -Force",
+        )
+        self.assertNotIn("hookSpecificOutput", response)
+
+    def test_unchanged_cursor_payload_with_transcript_path_allows(self) -> None:
+        payload = {
+            "hook_event_name": "preToolUse",
+            "tool_name": "Shell",
+            "tool_input": {"command": "git status"},
+            "transcript_path": "C:\\transcripts\\conversation.jsonl",
+        }
+        self.assertEqual(shell.hook_response(payload), {"permission": "allow"})
+
+    def test_hook_reads_utf8_stdin_with_bom_under_legacy_code_page(self) -> None:
+        payload = {
+            "hook_event_name": "preToolUse",
+            "tool_name": "Shell",
+            "tool_input": {"command": "echo 你好"},
+            "transcript_path": "C:\\transcripts\\conversation.jsonl",
+        }
+        data = b"\xef\xbb\xbf" + json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        stdin = io.TextIOWrapper(io.BytesIO(data), encoding="cp936")
+        stdout = io.StringIO()
+        with (
+            patch.object(sys, "stdin", stdin),
+            patch.object(sys, "stdout", stdout),
+            patch.object(shell, "rewrite_command", lambda cmd: "rewritten " + cmd),
+        ):
+            shell.hook_main()
+        response = json.loads(stdout.getvalue())
+        self.assertEqual(response["permission"], "allow")
+        self.assertEqual(response["updated_input"]["command"], "rewritten echo 你好")
 
     def test_claude_response_uses_hook_specific_output(self) -> None:
         payload = {
