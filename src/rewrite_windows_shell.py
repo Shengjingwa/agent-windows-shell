@@ -125,7 +125,10 @@ _DELETE_VERB = re.compile(r"(?<![\w-])[/-]?delete\b", re.I)
 
 # Line continuations, escapes, quotes and expansions that the target shell
 # removes before it runs a word: `r\m`, `r''m`, `r^d`, `r%x%d`, `${X:-rm}`, `$1rm`.
-_SHELL_NOISE = re.compile(r"[\\^`]\r?\n|[\\'\"^`\x00{}]|%[^%\s]*%|\$\{[A-Za-z_]\w*(?::?[-=+?])?|\$\d")
+_SHELL_NOISE = re.compile(
+    r"[\\^`]\r?\n|\$\([^()\n]{0,200}\)|`[^`\n]{0,200}`"
+    r"|[\\'\"^`\x00{}]|%[^%\s]*%|\$\{[A-Za-z_]\w*(?::?[-=+?])?|\$\d"
+)
 # With a quoted delimiter the body is not expanded, and here it only becomes
 # a git or gh message, so words like "rm" or "shutdown" in it run nothing.
 _MESSAGE_HEREDOC = re.compile(
@@ -384,8 +387,9 @@ def host_is_windows_powershell() -> bool:
     first = os.environ.get("PSModulePath", "").split(";")[0].rstrip("\\/").lower()
     if not first.endswith(("\\windowspowershell\\modules", "/windowspowershell/modules")):
         return False
-    machine = (os.environ.get(name, "").rstrip("\\/").lower() for name in ("ProgramW6432", "ProgramFiles", "SystemRoot"))
-    return not any(root and first.startswith(root + "\\") for root in machine)
+    machine = [os.environ.get(name, "").rstrip("\\/").lower() for name in ("ProgramW6432", "ProgramFiles", "SystemRoot")]
+    machine = [root for root in machine if root]
+    return bool(machine) and not any(first.startswith(root + "\\") for root in machine)
 
 
 # --------------------------------------------------------------------------

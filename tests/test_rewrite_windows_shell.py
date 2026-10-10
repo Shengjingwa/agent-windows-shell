@@ -258,6 +258,8 @@ class RoutingTests(unittest.TestCase):
             "export A=1; ${X:-rm} -rf build",
             "export A=1; r${X}m -rf build",
             "export A=1; r\x00m -rf build",
+            "export A=1; r$(echo)m -rf build",
+            "export A=1; r`echo`m -rf build",
             "export A=1; rsync -a --de\\lete a/ b/",
             "@echo off\nr^d /s /q build",
             "@echo off\nr%nope%d /s /q build",
@@ -349,6 +351,8 @@ class RoutingTests(unittest.TestCase):
             "export A=1\n" + "git commit -m \"$(cat <<'E'\n" * 20000,
             "export A=1; " + "(git " * 20000,
             "@echo off\n" + "robocopy " * 20000,
+            "export A=1; " + "$(x" * 40000,
+            "export A=1; " + "`x" * 60000,
         ):
             start = time.perf_counter()
             shell.plan_command(command, settings)
@@ -906,6 +910,10 @@ class WrapperTests(unittest.TestCase):
             }
             with self.subTest(first=first), patch.dict(os.environ, env):
                 self.assertIs(REAL_HOST_IS_WINDOWS_POWERSHELL(), expected)
+        with patch.dict(os.environ, {"PSModulePath": "C:\\Program Files\\WindowsPowerShell\\Modules"}):
+            for name in ("ProgramFiles", "ProgramW6432", "SystemRoot"):
+                os.environ.pop(name, None)
+            self.assertIs(REAL_HOST_IS_WINDOWS_POWERSHELL(), False)
 
     def test_windows_powershell_host_gets_utf8_setup(self) -> None:
         # The kit profile is written for PowerShell 7 only.
