@@ -237,16 +237,88 @@ class RoutingTests(unittest.TestCase):
             "@echo off\nreg delete HKCU\\Software\\X /f",
             "@echo off\nsc.exe delete svc",
             "@echo off\nschtasks /Delete /TN x /F",
+            "export A=1; git.exe clean -fdx",
+            "export A=1; git -C . -c core.x=y clean -fdx",
+            "export A=1; truncate build/keep.txt -s 0",
+            "@echo off\nformat.com D: /q",
+            '@echo off\nformat "D:" /q',
         ):
             decision = route(
                 command, config(autoRouteBash=True, autoRouteCmd=True), bash=BASH, cmd=CMD
             )
-            self.assertEqual(decision.shell, "host", command)
+            self.assertEqual((decision.shell, decision.reason), ("host", "unsafe-command"), command)
+
+    def test_escaped_or_expanded_destructive_commands_stay_in_host(self) -> None:
+        for command in (
+            "export A=1; r\\m -rf build",
+            "export A=1; r''m -rf build",
+            'export A=1; "r"m -rf build',
+            "export A=1; r\\\nm -rf build",
+            "export A=1; $1rm -rf build",
+            "export A=1; ${X:-rm} -rf build",
+            "export A=1; r${X}m -rf build",
+            "export A=1; r\x00m -rf build",
+            "export A=1; rsync -a --de\\lete a/ b/",
+            "@echo off\nr^d /s /q build",
+            "@echo off\nr%nope%d /s /q build",
+            "cat > .gitignore <<'EOF'\nbuild/\nEOF\ngit -C . clean -fdx",
+        ):
+            decision = route(
+                command,
+                config(wrapHeredoc=True, autoRouteBash=True, autoRouteCmd=True),
+                bash=BASH,
+                cmd=CMD,
+            )
+            self.assertEqual((decision.shell, decision.reason), ("host", "unsafe-command"), command)
+
+    def test_destructive_options_anywhere_in_the_command_stay_in_host(self) -> None:
+        for command in (
+            "@echo off\r\nrobocopy src dst ^\r\n  /MIR\r\n",
+            "@echo off\nrobocopy src dst -MIR",
+            "@echo off\nset OPTS=/MIR\nrobocopy src dst %OPTS%",
+            '@echo off\n"C:\\Windows\\System32\\sc.exe" delete svc',
+            "@echo off\nsc \\\\server delete svc",
+            "@echo off\nschtasks /tn x /delete /f",
+            "@echo off\nreg ^\n delete HKCU\\Software\\X /f",
+            "@echo off\nnet use Z: /delete",
+            "@echo off\nvssadmin delete shadows /all",
+            "export A=1; git -C ^\nrepo clean -fdx",
+            "export A=1; git reset --hard HEAD~1",
+            "export A=1; git branch -D old",
+            "export A=1; rsync -a --del src/ dst/",
+        ):
+            decision = route(
+                command, config(autoRouteBash=True, autoRouteCmd=True), bash=BASH, cmd=CMD
+            )
+            self.assertEqual((decision.shell, decision.reason), ("host", "unsafe-command"), command)
 
     def test_commit_message_words_do_not_block_a_heredoc(self) -> None:
-        command = "git commit -m \"$(cat <<'EOF'\nfeat: format tables, truncate long names\nEOF\n)\""
-        decision = route(command, config(wrapHeredoc=True), bash=BASH, cmd=CMD)
-        self.assertEqual((decision.shell, decision.reason), ("git-bash", "bash-syntax:heredoc"))
+        for command in (
+            "git commit -m \"$(cat <<'EOF'\nfeat: format tables, truncate long names\nEOF\n)\"",
+            "git commit -m \"$(cat <<'EOF'\nrefactor: rm unused imports\nEOF\n)\"",
+            "git add -A && git commit -m \"$(cat <<'EOF'\nfix: del key\n\nshutdown hook\nEOF\n)\"",
+            "gh pr create --title x --body \"$(cat <<'EOF'\n- rm dead code\nEOF\n)\"",
+        ):
+            decision = route(command, config(wrapHeredoc=True), bash=BASH, cmd=CMD)
+            self.assertEqual(
+                (decision.shell, decision.reason), ("git-bash", "bash-syntax:heredoc"), command
+            )
+
+    def test_only_message_heredocs_are_exempt(self) -> None:
+        # Expanded bodies, eval and text after the closing delimiter still run.
+        for command in (
+            "eval git commit -m \"$(cat <<'EOF'\n$(rm -rf build)\nEOF\n)\"",
+            "git commit -m \"$(cat <<EOF\n$(rm -rf build)\nEOF\n)\"",
+            "git commit -m \"$(cat <<'EOF'\nmsg\nEOF\nrm -rf build\n)\"",
+            "cat <<'EOF' | bash\nrm -rf build\nEOF",
+            "git commit -F - <<'EOF'\nmsg\nEOF\nrm -rf build",
+        ):
+            decision = route(command, config(wrapHeredoc=True), bash=BASH, cmd=CMD)
+            self.assertEqual((decision.shell, decision.reason), ("host", "unsafe-command"), command)
+
+    def test_long_options_are_not_cmdlet_names(self) -> None:
+        decision = route("docker compose down --remove-orphans && echo ok", config())
+        self.assertNotEqual(decision.reason, "powershell-syntax")
 
     def test_powershell_modulo_is_not_a_batch_variable(self) -> None:
         decision = route(
@@ -269,10 +341,19 @@ class RoutingTests(unittest.TestCase):
             "cat > big.txt <<'EOF'\n" + body + "\nEOF",
             "echo " + "[[ x " * 20000,
             "Get-Content x | " + "ForEach-Object { try { $_ } catch { } } | " * 5000 + "Sort-Object",
+            "Get-Item x|" + "a|" * 40000,
+            "set -" + "e" * 80000 + "1",
+            "touch a\n" * 20000,
+            "export A=1; " + "truncate " * 20000,
+            "export A=1; " + "git " * 20000,
+            "export A=1\n" + "git commit -m \"$(cat <<'E'\n" * 20000,
+            "export A=1; " + "(git " * 20000,
+            "@echo off\n" + "robocopy " * 20000,
         ):
             start = time.perf_counter()
             shell.plan_command(command, settings)
-            self.assertLess(time.perf_counter() - start, 1.0)
+            # Each shape takes under 1 s; a quadratic regression takes over 5 s.
+            self.assertLess(time.perf_counter() - start, 3.0, command[:40])
 
     def test_double_brackets_need_bash_spacing(self) -> None:
         bash_case = route("[[ -f setup.sh ]] && echo yes", config(autoRouteBash=True))
@@ -426,6 +507,13 @@ class AliasAndProxyTests(unittest.TestCase):
             actual,
             "Get-ChildItem -Force; curl.exe https://example.com | Write-Output",
         )
+        with patch.object(shell, "find_pwsh", return_value=None):
+            actual = shell.rewrite_command("curl https://example.com; ls -la; which git", config())
+        self.assertEqual(
+            actual,
+            "curl.exe https://example.com; Get-ChildItem -Force; "
+            "(Get-Command git -ErrorAction SilentlyContinue).Source",
+        )
 
     def test_does_not_rewrite_strings_comments_or_arguments(self) -> None:
         command = "Write-Output 'ls -la && curl x'\n# ls -la\nWrite-Output curl"
@@ -560,6 +648,17 @@ class FlushGuardTests(unittest.TestCase):
         "git status\nirm https://api.example.com/items",
         "if ($ok) { Import-Csv a.csv | Where-Object { $_.ok } } else { 'none' }",
         "foreach ($u in 'a', 'b') {\n  irm https://x/$u\n}",
+        # Records reach the output in too many ways to follow, so any source counts.
+        "Import-Csv small.csv | Select-Object -First 2",
+        "(Get-Content pkg.json -Raw | ConvertFrom-Json).scripts",
+        "$j = Get-Content pkg.json -Raw | ConvertFrom-Json; $j.items",
+        "irm https://api.example.com/items | ForEach-Object items",
+        "$o = [pscustomobject]@{a=1}; $o",
+        "$items = irm https://api.example.com/items",
+        "Get-Location",
+        "pwd",
+        "Get-Date | Get-Member -MemberType Property",
+        "$PSVersionTable.PSVersion",
     )
     SAFE = (
         "git status --short",
@@ -577,19 +676,10 @@ class FlushGuardTests(unittest.TestCase):
         "Get-ChildItem | Select-Object -First 3",
         "using namespace System.IO\nGet-ChildItem | Select-Object Name",
         "param($p)\nGet-ChildItem | Select-Object Name",
-        "$items = irm https://api.example.com/items",
-        "try { $j = $body | ConvertFrom-Json } catch { }",
-        "foreach ($e in 1, 2) { [int]$n = (irm https://x/$e).count }",
-        "(Get-Content x.json -Raw | ConvertFrom-Json).data.id -join ','",
-        "irm https://api.example.com/items | ForEach-Object { $_.name }",
-        "Get-Content x | ForEach-Object { $_ | ConvertFrom-Json } | Group-Object { $_.id }",
-        "Import-Csv a.csv | Where-Object { $_.ok } | ForEach-Object { $_.name }",
-        "foreach ($t in 1, 2) { $l = Get-Content x | ForEach-Object { $_ | ConvertFrom-Json }",
-        "irm https://api.example.com/items | Out-Null",
-        "irm https://api.example.com/items | ConvertTo-Json -Depth 5",
-        "Get-Content x.json -Raw | ConvertFrom-Json | Format-List",
-        "git log --grep=ConvertFrom-Json",
+        "param($p)\nirm https://api.example.com/items",
         "Write-Output 'irm https://x | ConvertFrom-Json'",
+        "Write-Output 'pwd'  # Get-Location",
+        "git log --oneline -- gm.txt scripts/pwd",
     )
 
     def test_flags_commands_that_would_lose_a_table(self) -> None:
@@ -659,6 +749,20 @@ class FlushGuardEndToEndTests(unittest.TestCase):
         result = self.run_script(shell.flush_guarded(command))
         self.assertIn("Alpha", result.stdout)
         self.assertIn("done", result.stdout)
+
+    def test_other_records_survive_the_trailing_exit(self) -> None:
+        for command, expected in (
+            ("Get-Location; Write-Output done", "Path"),
+            ("'Alpha,Beta\n1,2\n3,4' | ConvertFrom-Csv | Select-Object -First 1; Write-Output done", "Alpha"),
+            ("$j = '{\"items\":[{\"Alpha\":1}]}' | ConvertFrom-Json; $j.items; Write-Output done", "Alpha"),
+        ):
+            with self.subTest(command=command):
+                self.assertTrue(shell.needs_flush_guard(command))
+                lost = self.run_script(command)
+                self.assertNotIn(expected, lost.stdout)
+                kept = self.run_script(shell.flush_guarded(command))
+                self.assertIn(expected, kept.stdout)
+                self.assertIn("done", kept.stdout)
 
     def test_parsed_json_survives_the_trailing_exit(self) -> None:
         command = "'{\"Alpha\":1,\"Beta\":2}' | ConvertFrom-Json; Write-Output done"
@@ -789,16 +893,27 @@ class WrapperTests(unittest.TestCase):
             ("C:\\Users\\me\\OneDrive\\Dokumente\\WindowsPowerShell\\Modules\\", True),
             ("C:\\Users\\me\\Documents\\PowerShell\\Modules", False),
             ("", False),
+            # Started outside PowerShell (Explorer, cmd, Claude's exec form).
+            ("C:\\Program Files\\WindowsPowerShell\\Modules", False),
+            ("C:\\Windows\\system32\\WindowsPowerShell\\v1.0\\Modules", False),
         ):
             value = first + ";C:\\Program Files\\WindowsPowerShell\\Modules"
-            with self.subTest(first=first), patch.dict(os.environ, {"PSModulePath": value}):
+            env = {
+                "PSModulePath": value,
+                "ProgramFiles": "C:\\Program Files",
+                "ProgramW6432": "C:\\Program Files",
+                "SystemRoot": "C:\\Windows",
+            }
+            with self.subTest(first=first), patch.dict(os.environ, env):
                 self.assertIs(REAL_HOST_IS_WINDOWS_POWERSHELL(), expected)
 
     def test_windows_powershell_host_gets_utf8_setup(self) -> None:
         # The kit profile is written for PowerShell 7 only.
         with patch.object(shell, "host_is_windows_powershell", return_value=True):
             actual = shell.rewrite_command("git status", config(utf8Prefix=False))
+            script = shell.rewrite_command("using namespace System.Text\n[StringBuilder]::new('ok')", config())
         self.assertEqual(actual, shell.UTF8_PREFIX + "git status")
+        self.assertFalse(script.startswith(shell.UTF8_PREFIX))
 
     def test_stale_wrapper_scripts_are_swept(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1000,6 +1115,108 @@ class HookProcessTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(completed.stdout.strip(), "")
+
+
+LEGACY_PROFILE_BLOCK = "\r\n".join(
+    (
+        "# agent-windows-shell (do not edit; managed by install.ps1)",
+        "$root = $env:AGENT_WINDOWS_SHELL_ROOT",
+        "if (-not $root) {",
+        "    $cfg = Join-Path $env:USERPROFILE '.agent-windows-shell.json'",
+        "    if (Test-Path -LiteralPath $cfg) {",
+        "        $root = (Get-Content -LiteralPath $cfg -Raw -Encoding UTF8 | ConvertFrom-Json).kitRoot",
+        "    }",
+        "}",
+        "if ($root) {",
+        "    $kitProfile = Join-Path $root 'src\\profile.ps1'",
+        "    if (Test-Path -LiteralPath $kitProfile) { . $kitProfile }",
+        "}",
+    )
+)
+MANAGED_PROFILE_BEGIN = "# >>> agent-windows-shell (managed by install.ps1; do not edit) >>>"
+USER_PROFILE_CODE = "function Get-Mine { 'mine' }\r\n"
+
+
+@unittest.skipUnless(os.name == "nt" and shutil.which("powershell.exe"), "needs Windows PowerShell")
+@unittest.skipIf(os.environ.get("AGENT_WINDOWS_SHELL_SELFTEST"), "install.ps1 is running this suite")
+class InstallerTests(unittest.TestCase):
+    """install.ps1 -Profile in a throwaway home, under the oldest supported host."""
+
+    def install(self, profile: bytes, settings: dict | None = None):
+        home = Path(tempfile.mkdtemp(prefix="aws-install-"))
+        self.addCleanup(shutil.rmtree, home, True)
+        path = home / "Documents" / "PowerShell" / "Microsoft.PowerShell_profile.ps1"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(profile)
+        config_path = home / ".agent-windows-shell.json"
+        config_path.write_text(json.dumps(settings or {}), encoding="utf-8")
+        env = dict(
+            os.environ,
+            USERPROFILE=str(home),
+            APPDATA=str(home / "AppData" / "Roaming"),
+            LOCALAPPDATA=str(home / "AppData" / "Local"),
+            AGENT_WINDOWS_SHELL_SELFTEST="1",
+        )
+        completed = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+             "-File", str(ROOT / "install.ps1"), "-Profile"],
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+            check=False,
+        )
+        # Windows PowerShell wraps warnings at the console width.
+        output = " ".join((completed.stdout + completed.stderr).split())
+        self.assertEqual(completed.returncode, 0, output)
+        return path, output, json.loads(config_path.read_text(encoding="utf-8-sig"))
+
+    def test_first_release_block_is_replaced_and_user_code_kept(self) -> None:
+        original = ("Set-Alias ll Get-ChildItem\r\n" + LEGACY_PROFILE_BLOCK + "\r\n" + USER_PROFILE_CODE).encode()
+        path, _output, settings = self.install(original, {"kitRoot": "C:\\old", "utf8Prefix": True})
+        text = path.read_bytes().decode("utf-8")
+        self.assertNotIn("$root = $env:AGENT_WINDOWS_SHELL_ROOT", text)
+        self.assertEqual(text.count(MANAGED_PROFILE_BEGIN), 1)
+        self.assertIn("Set-Alias ll Get-ChildItem", text)
+        self.assertIn(USER_PROFILE_CODE, text)
+        self.assertEqual(path.with_name(path.name + ".agent-windows-shell.bak").read_bytes(), original)
+        self.assertNotIn("kitRoot", settings)
+        self.assertNotIn("utf8Prefix", settings)
+
+    def test_edited_first_release_block_is_left_alone(self) -> None:
+        edited = LEGACY_PROFILE_BLOCK.replace("if ($root) {", "if ($root) {\r\n    Write-Host mine", 1)
+        original = (edited + "\r\n" + USER_PROFILE_CODE).encode()
+        path, output, settings = self.install(original, {"kitRoot": "C:\\old", "utf8Prefix": True})
+        self.assertEqual(path.read_bytes(), original)
+        self.assertIn("edited block", output)
+        self.assertEqual(settings.get("kitRoot"), "C:\\old")
+        self.assertIs(settings.get("utf8Prefix"), True)
+
+    def test_first_release_block_next_to_the_managed_block_is_removed(self) -> None:
+        managed = MANAGED_PROFILE_BEGIN + "\nif ($false) { }\n# <<< agent-windows-shell <<<\n"
+        original = (LEGACY_PROFILE_BLOCK.replace("\r\n", "\n") + "\n" + managed + USER_PROFILE_CODE).encode()
+        path, _output, _settings = self.install(original)
+        text = path.read_bytes().decode("utf-8")
+        self.assertNotIn("$root = $env:AGENT_WINDOWS_SHELL_ROOT", text)
+        self.assertEqual(text.count(MANAGED_PROFILE_BEGIN), 1)
+        self.assertNotIn("if ($false)", text)
+        self.assertIn(USER_PROFILE_CODE, text)
+
+    def test_utf16_profile_without_bom_is_left_alone(self) -> None:
+        original = ("Set-Alias ll Get-ChildItem\r\n").encode("utf-16-le")
+        path, output, settings = self.install(original, {"utf8Prefix": True})
+        self.assertEqual(path.read_bytes(), original)
+        self.assertIn("is not UTF-8", output)
+        self.assertIs(settings.get("utf8Prefix"), True)
+
+    def test_profile_keeps_its_bom(self) -> None:
+        path, _output, _settings = self.install(b"\xef\xbb\xbfSet-Alias ll Get-ChildItem\r\n")
+        raw = path.read_bytes()
+        self.assertTrue(raw.startswith(b"\xef\xbb\xbfSet-Alias ll Get-ChildItem"))
+        self.assertEqual(raw.count(b"\xef\xbb\xbf"), 1)
+        self.assertIn(MANAGED_PROFILE_BEGIN.encode(), raw)
 
 
 if __name__ == "__main__":

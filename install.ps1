@@ -140,7 +140,7 @@ function Install-SkillLink {
     }
     if (Test-Path -LiteralPath $LinkPath) {
         $item = Get-Item -LiteralPath $LinkPath -Force
-        if ($item.LinkType) {
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
             if (@($item.Target) -contains $Source) {
                 Write-Host "skill   $LinkPath (already linked)"
                 return
@@ -153,7 +153,11 @@ function Install-SkillLink {
                 Write-Warning "$LinkPath holds files this installer did not create; left unchanged"
                 return
             }
-            Remove-Item -LiteralPath $LinkPath -Recurse -Force
+            # An old copy holds only SKILL.md. Never delete recursively here:
+            # a recursive delete can follow a junction into the kit itself.
+            $copy = Join-Path $LinkPath 'SKILL.md'
+            if (Test-Path -LiteralPath $copy) { [IO.File]::Delete($copy) }
+            [IO.Directory]::Delete($LinkPath)
         }
     }
     New-Item -ItemType Junction -Path $LinkPath -Target $Source | Out-Null
@@ -239,31 +243,114 @@ Write-Host "pwsh    $(if ($pwsh) { $pwsh } else { '(not found)' })"
 Write-Host "gitbash $(if ($gitBash) { $gitBash } else { '(not found)' })"
 Write-Host "cmd     $(if ($commandPrompt) { $commandPrompt } else { '(not found)' })"
 
+# Test before writing anything. The installer tests run this script with the
+# variable already set, so they skip the suite they belong to.
+if (-not $env:AGENT_WINDOWS_SHELL_SELFTEST) {
+    $env:AGENT_WINDOWS_SHELL_SELFTEST = '1'
+    try {
+        & $python (Join-Path $KitRoot 'src\rewrite_windows_shell.py') --test
+    } finally {
+        Remove-Item Env:AGENT_WINDOWS_SHELL_SELFTEST
+    }
+    if ($LASTEXITCODE -ne 0) { throw 'rewrite tests failed' }
+}
+
 # pwsh finds $PROFILE under the Documents known folder, which OneDrive or a
 # policy may move. A redirected USERPROFILE (a test sandbox) keeps its own.
-$documents = [Environment]::GetFolderPath('MyDocuments')
-if (-not $documents -or $env:USERPROFILE -ne [Environment]::GetFolderPath('UserProfile')) {
+$documents = [Environment]::GetFolderPath('MyDocuments', 'DoNotVerify')
+if (-not $documents -or $env:USERPROFILE.TrimEnd('\') -ne [Environment]::GetFolderPath('UserProfile').TrimEnd('\')) {
     $documents = Join-Path $env:USERPROFILE 'Documents'
 }
 $userProfile = Join-Path $documents 'PowerShell\Microsoft.PowerShell_profile.ps1'
 $profileBegin = '# >>> agent-windows-shell (managed by install.ps1; do not edit) >>>'
 $profileEnd = '# <<< agent-windows-shell <<<'
-# The first release wrote an unmarked block that read env vars and JSON. It
-# ends with the unindented `}` that closes `if ($root) {`.
-$legacyBlock = '(?ms)^# agent-windows-shell \(do not edit; managed by install\.ps1\)\r?\n' +
-    '.*?^if \(\$root\) \{.*?^\}(?=[ \t]*\r?$)'
+# The first release wrote this unmarked block. Only an exact copy is removed:
+# an edited one may hold the user's own code.
+$legacyLines = @(
+    '# agent-windows-shell (do not edit; managed by install.ps1)'
+    '$root = $env:AGENT_WINDOWS_SHELL_ROOT'
+    'if (-not $root) {'
+    '$cfg = Join-Path $env:USERPROFILE ''.agent-windows-shell.json'''
+    'if (Test-Path -LiteralPath $cfg) {'
+    '$root = (Get-Content -LiteralPath $cfg -Raw -Encoding UTF8 | ConvertFrom-Json).kitRoot'
+    '}'
+    '}'
+    'if ($root) {'
+    '$kitProfile = Join-Path $root ''src\profile.ps1'''
+    'if (Test-Path -LiteralPath $kitProfile) { . $kitProfile }'
+    '}'
+)
+$legacyBlock = '(?m)^' + (($legacyLines | ForEach-Object { '[ \t]*' + [regex]::Escape($_) + '[ \t]*' }) -join '\r?\n') + '(?=\r?$)'
+$legacyHeader = '(?m)^[ \t]*' + [regex]::Escape($legacyLines[0])
 $profileText = ''
 $profileReadable = $true
+$profileBom = $false
 if (Test-Path -LiteralPath $userProfile) {
     try {
+        $bytes = [IO.File]::ReadAllBytes($userProfile)
+        $profileBom = $bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF
+        $skip = if ($profileBom) { 3 } else { 0 }
         # Strict: a profile saved in a legacy code page must not be rewritten as UTF-8.
-        $profileText = [IO.File]::ReadAllText($userProfile, [Text.UTF8Encoding]::new($false, $true))
+        $profileText = [Text.UTF8Encoding]::new($false, $true).GetString($bytes, $skip, $bytes.Length - $skip)
     } catch {
         $profileReadable = $false
     }
+    # UTF-16 without a BOM decodes as valid UTF-8 full of NUL characters.
+    if ($profileText.IndexOf([char]0) -ge 0) {
+        $profileReadable = $false
+        $profileText = ''
+    }
+}
+$legacyEdited = [regex]::Matches($profileText, $legacyHeader).Count -ne [regex]::Matches($profileText, $legacyBlock).Count
+
+if ($Profile -and -not $profileReadable) {
+    Write-Warning "$userProfile is not UTF-8; left unchanged. Save it as UTF-8 and run again, or add the block from README.md by hand."
+} elseif ($Profile -and $legacyEdited) {
+    Write-Warning "$userProfile has an edited block that starts with '$($legacyLines[0])'; left unchanged. Delete that block by hand and run again."
+} elseif ($Profile) {
+    # A literal path keeps shell start-up cheap: no env lookup, no JSON parse.
+    $kitProfile = Join-Path $KitRoot 'src\profile.ps1'
+    $quotedProfile = "'" + $kitProfile.Replace("'", "''") + "'"
+    $snippet = @(
+        $profileBegin,
+        "if ([IO.File]::Exists($quotedProfile)) { . $quotedProfile }",
+        $profileEnd
+    ) -join "`r`n"
+    $managed = '(?s)' + [regex]::Escape($profileBegin) + '.*?' + [regex]::Escape($profileEnd)
+    if ($profileText -cmatch $managed) {
+        $updated = [regex]::Replace($profileText, $managed, { param($m) $snippet })
+        $updated = [regex]::Replace($updated, $legacyBlock + '(?:\r?\n)?', '')
+        $state = 'refreshed'
+    } elseif ($profileText -cmatch $legacyBlock) {
+        $updated = [regex]::Replace($profileText, $legacyBlock, { param($m) $snippet })
+        $state = 'upgraded from the first release'
+    } elseif ([string]::IsNullOrWhiteSpace($profileText)) {
+        $updated = $snippet + "`r`n"
+        $state = 'written'
+    } else {
+        $updated = $profileText.TrimEnd() + "`r`n`r`n" + $snippet + "`r`n"
+        $state = 'appended'
+    }
+    $backup = $null
+    if ($updated -cne $profileText) {
+        if ($profileText -cmatch $legacyBlock) {
+            $backup = "$userProfile.agent-windows-shell.bak"
+            [IO.File]::Copy($userProfile, $backup, $true)
+        }
+        if ($profileBom) {
+            [IO.File]::WriteAllText($userProfile, $updated, [Text.UTF8Encoding]::new($true))
+        } else {
+            Write-Utf8NoBom -LiteralPath $userProfile -Value $updated
+        }
+        $profileText = $updated
+    } else {
+        $state = 'unchanged'
+    }
+    Write-Host "profile $userProfile ($state)"
+    if ($backup) { Write-Host "        previous profile saved as $backup" }
 }
 # Settings the managed profile block replaces stay in the config until that block exists.
-$profileManaged = ($Profile -and $profileReadable) -or $profileText.Contains($profileBegin)
+$profileManaged = $profileText.Contains($profileBegin)
 
 $homeCfg = Join-Path $env:USERPROFILE '.agent-windows-shell.json'
 $cfg = Read-JsonObject -LiteralPath $homeCfg
@@ -313,48 +400,11 @@ if ($removed.Count -gt 0) {
     Write-Host "        dropped legacy defaults: $($removed -join ', ')"
 }
 
-& $python (Join-Path $KitRoot 'src\rewrite_windows_shell.py') --test
-if ($LASTEXITCODE -ne 0) { throw 'rewrite tests failed' }
-
 if ($Env) {
     [Environment]::SetEnvironmentVariable('PYTHONUTF8', '1', 'User')
     [Environment]::SetEnvironmentVariable('PYTHONIOENCODING', 'utf-8', 'User')
     [Environment]::SetEnvironmentVariable('AGENT_WINDOWS_SHELL_ROOT', $KitRoot, 'User')
     Write-Host 'env     PYTHONUTF8, PYTHONIOENCODING, AGENT_WINDOWS_SHELL_ROOT (User)'
-}
-
-if ($Profile -and -not $profileReadable) {
-    Write-Warning "$userProfile is not UTF-8; left unchanged. Save it as UTF-8 and run again, or add the block from README.md by hand."
-} elseif ($Profile) {
-    # A literal path keeps shell start-up cheap: no env lookup, no JSON parse.
-    $kitProfile = Join-Path $KitRoot 'src\profile.ps1'
-    $quotedProfile = "'" + $kitProfile.Replace("'", "''") + "'"
-    $snippet = @(
-        $profileBegin,
-        "if ([IO.File]::Exists($quotedProfile)) { . $quotedProfile }",
-        $profileEnd
-    ) -join "`r`n"
-    $existing = $profileText
-    $managed = '(?s)' + [regex]::Escape($profileBegin) + '.*?' + [regex]::Escape($profileEnd)
-    if ($existing -match $managed) {
-        $updated = [regex]::Replace($existing, $managed, { param($m) $snippet })
-        $state = 'refreshed'
-    } elseif ($existing -match $legacyBlock) {
-        $updated = [regex]::Replace($existing, $legacyBlock, { param($m) $snippet })
-        $state = 'upgraded from the first release'
-    } elseif ([string]::IsNullOrWhiteSpace($existing)) {
-        $updated = $snippet + "`r`n"
-        $state = 'written'
-    } else {
-        $updated = $existing.TrimEnd() + "`r`n`r`n" + $snippet + "`r`n"
-        $state = 'appended'
-    }
-    if ($updated -cne $existing) {
-        Write-Utf8NoBom -LiteralPath $userProfile -Value $updated
-    } else {
-        $state = 'unchanged'
-    }
-    Write-Host "profile $userProfile ($state)"
 }
 
 $skillSource = Join-Path $KitRoot 'skills\windows-agent-shell'
@@ -396,7 +446,7 @@ if ($Cursor) {
         -Value ($hooks | ConvertTo-Json -Depth 20)
     Write-Host "cursor  $hooksPath"
     # Without pwsh 7 the host is 5.1, and the hook adds the UTF-8 setup itself.
-    if ($pwsh -and -not $profileManaged -and $profileText -notmatch $legacyBlock -and $cfg.utf8Prefix -ne $true) {
+    if ($pwsh -and -not $profileManaged -and $profileText -cnotmatch $legacyHeader -and $cfg.utf8Prefix -ne $true) {
         Write-Warning "No agent-windows-shell block in $userProfile, so Cursor's shells keep the console code page and non-ASCII output can garble. Run install.ps1 -Profile, or set `"utf8Prefix`": true in $homeCfg."
     }
     # Cursor ignores ~\.cursor\rules; an earlier release copied a rule file there.
@@ -471,30 +521,58 @@ if ($Claude) {
     if (-not (Test-Path $claudeDir)) { New-Item -ItemType Directory -Force -Path $claudeDir | Out-Null }
     $rewrite = Join-Path $KitRoot 'src\rewrite_windows_shell.py'
     $settingsPath = Join-Path $claudeDir 'settings.json'
-    # Exec form: Claude runs shell-form hooks in Git Bash, which cannot parse `& "…"`.
+    # Exec form: Claude runs shell-form hooks in Git Bash, which cannot parse `& "..."`.
     # Its Bash tool already runs bash, so only the PowerShell tool is matched.
-    $entry = @{
+    $entry = [pscustomobject]@{
         matcher = 'PowerShell'
         hooks   = @(
-            @{
+            [pscustomobject]@{
                 type    = 'command'
                 command = $python
                 args    = @($rewrite)
             }
         )
     }
-    if (Test-Path $settingsPath) {
-        Write-Host "claude  $settingsPath exists — merge PreToolUse manually; see adapters\claude\README.md"
+    $settings = [pscustomobject]@{}
+    if (Test-Path -LiteralPath $settingsPath) {
+        try { $settings = Read-JsonObject -LiteralPath $settingsPath } catch { $settings = $null }
+        if ($settings -isnot [pscustomobject] -or
+            -not (Test-PlainJson (Get-Content -LiteralPath $settingsPath -Raw -Encoding UTF8)) -or
+            ($settings.PSObject.Properties['hooks'] -and $settings.hooks -isnot [pscustomobject])) {
+            $settings = $null
+        }
+    }
+    if ($null -eq $settings) {
+        Write-Warning "$settingsPath is not plain JSON; left unchanged. Merge PreToolUse by hand; see adapters\claude\README.md"
         Write-Host "        command = $python"
         Write-Host "        args    = [`"$rewrite`"]"
     } else {
-        $doc = @{
-            hooks = @{
-                PreToolUse = @($entry)
+        if (-not $settings.PSObject.Properties['hooks']) {
+            Set-ObjectProperty -Object $settings -Name hooks -Value ([pscustomobject]@{})
+        }
+        # Replace this kit's hooks from earlier installs (the first release used
+        # shell form, which fails in Git Bash) and keep every other hook.
+        $groups = New-Object System.Collections.ArrayList
+        $property = $settings.hooks.PSObject.Properties['PreToolUse']
+        if ($property) {
+            foreach ($group in @($property.Value)) {
+                if ($group -isnot [pscustomobject] -or -not $group.PSObject.Properties['hooks']) {
+                    [void]$groups.Add($group)
+                    continue
+                }
+                $kept = @(@($group.hooks) | Where-Object {
+                        ("$($_.command) $(@($_.args) -join ' ')").IndexOf(
+                            'rewrite_windows_shell.py', [StringComparison]::OrdinalIgnoreCase) -lt 0
+                    })
+                if ($kept.Count -gt 0) {
+                    Set-ObjectProperty -Object $group -Name hooks -Value $kept
+                    [void]$groups.Add($group)
+                }
             }
         }
-        Write-Utf8NoBom -LiteralPath $settingsPath `
-            -Value ($doc | ConvertTo-Json -Depth 8)
+        [void]$groups.Add($entry)
+        Set-ObjectProperty -Object $settings.hooks -Name PreToolUse -Value @($groups)
+        Write-Utf8NoBom -LiteralPath $settingsPath -Value ($settings | ConvertTo-Json -Depth 20)
         Write-Host "claude  $settingsPath"
     }
     Install-SkillLink -Source $skillSource `

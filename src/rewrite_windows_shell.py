@@ -68,7 +68,8 @@ EXPLICIT_SHELL = re.compile(
 )
 POWERSHELL_SYNTAX = re.compile(
     r"\$(?:env:|global:|script:|local:|LASTEXITCODE\b|\?|_)|"
-    r"\b(?:Get|Set|New|Remove|Test|Write|Select|Where|ForEach|Invoke|Start|Stop)-"
+    # Not after `-`: `docker compose down --remove-orphans` is no cmdlet.
+    r"(?<![\w-])(?:Get|Set|New|Remove|Test|Write|Select|Where|ForEach|Invoke|Start|Stop)-"
     r"[A-Za-z][A-Za-z0-9]*\b|-(?:LiteralPath|ErrorAction)\b|"
     r"\[(?:System\.|IO\.|Text\.)|::|@\{|@\(",
     re.I,
@@ -105,11 +106,58 @@ def _build_unsafe():
         r"(?<![\w.$-])(?:rm|del|erase|rd|rmdir|diskpart|mkfs|dd|shutdown|"
         r"reboot|shred|unlink)(?![\w-])"
         # Commit messages say "format" and "truncate"; require the command form.
-        r"|(?<![\w.$-])format\s+(?:/\S+\s+)*[A-Za-z]:|(?<![\w.$-])truncate\s+-"
-        r"|(?<![\w-])--?delete\b|\bgit\s+clean\b|\brobocopy\b[^\n]*?/(?:mir|purge|move?)\b"
-        r"|\b(?:reg|sc|schtasks)(?:\.exe)?\s+/?delete\b",
+        r"|(?<![\w.$-])format(?:\.com)?\s+(?:/\S+\s+)*[A-Za-z]:"
+        # A few words between command and option keep the scan linear.
+        r"|(?<![\w.$-])truncate[ \t]+(?:[^\s;&|]+[ \t]+){0,8}?-{1,2}[A-Za-z]"
+        r"|(?<![\w-])(?:--?delete|--del|--hard)\b|\bbranch[ \t]+(?-i:-[a-zA-Z]*D)\b"
+        r"|\bgit(?:\.exe)?[ \t]+(?:[^\s;&|]+[ \t]+){0,8}?clean\b"
+        # Options can sit on a continuation line or in a variable.
+        r"|\brobocopy\b",
         re.I,
     )
+
+
+# These delete through a verb that can sit anywhere in the command line:
+# `sc \\server delete svc`, `schtasks /tn x /delete`, `net use Z: /delete`.
+_ADMIN_TOOL = re.compile(r"\b(?:reg|sc|schtasks|net|vssadmin|wmic|bcdedit)(?:\.exe)?\b", re.I)
+_DELETE_VERB = re.compile(r"(?<![\w-])[/-]?delete\b", re.I)
+
+
+# Line continuations, escapes, quotes and expansions that the target shell
+# removes before it runs a word: `r\m`, `r''m`, `r^d`, `r%x%d`, `${X:-rm}`, `$1rm`.
+_SHELL_NOISE = re.compile(r"[\\^`]\r?\n|[\\'\"^`\x00{}]|%[^%\s]*%|\$\{[A-Za-z_]\w*(?::?[-=+?])?|\$\d")
+# With a quoted delimiter the body is not expanded, and here it only becomes
+# a git or gh message, so words like "rm" or "shutdown" in it run nothing.
+_MESSAGE_HEREDOC = re.compile(
+    r"(?:^|[;&|(\n])[ \t]*(?:git|gh)\b[^\n;&|(]*?\s(?:-m|--message|-b|--body)[ \t=]*\"?"
+    r"\$\([ \t]*cat[ \t]+<<-?[ \t]*(['\"])(?P<delim>[A-Za-z_][\w.-]*)\1[ \t]*\r?\n",
+    re.I,
+)
+
+
+def _blank_message_heredocs(command: str) -> str:
+    edits = []
+    for tries, match in enumerate(_MESSAGE_HEREDOC.finditer(command)):
+        if tries == 8:
+            break
+        end = re.compile(r"(?m)^[ \t]*" + re.escape(match.group("delim")) + r"[ \t]*\r?$")
+        closing = end.search(command, match.end())
+        if closing:
+            edits.append((match.end(), closing.start()))
+    for start, stop in reversed(edits):
+        body = re.sub(r"[^\r\n]", " ", command[start:stop])
+        command = command[:start] + body + command[stop:]
+    return command
+
+
+def is_unsafe(command: str) -> bool:
+    """Best effort, not a sandbox: does a destructive command appear anywhere?"""
+    text = _blank_message_heredocs(command)
+    unsafe = unsafe_auto_route()
+    for variant in (text, _SHELL_NOISE.sub("", text)):
+        if unsafe.search(variant) or (_ADMIN_TOOL.search(variant) and _DELETE_VERB.search(variant)):
+            return True
+    return False
 
 
 def _build_bash_signatures():
@@ -117,7 +165,10 @@ def _build_bash_signatures():
         ("shebang", re.compile(r"^\s*#!\s*/(?:usr/bin/env\s+)?(?:ba|z|k)?sh\b", re.I)),
         ("source", re.compile(r"(?:^|[;\n])[ \t]*source\s+[^\s;]+", re.I)),
         ("export", re.compile(r"(?:^|[;\n])[ \t]*export\s+[A-Za-z_][A-Za-z0-9_]*=", re.I)),
-        ("set-options", re.compile(r"(?:^|[;\n])[ \t]*set\s+-[a-zA-Z]*[euxo][a-zA-Z]*\b")),
+        (
+            "set-options",
+            re.compile(r"(?:^|[;\n])[ \t]*set[ \t]+-[a-zA-Z]{0,15}[euxo][a-zA-Z]{0,15}(?![\w-])"),
+        ),
         # Bash needs the inner spaces; PowerShell generics write `List[[string]]`.
         # The bound keeps a long line of `[[` openers linear.
         ("double-brackets", re.compile(r"(?<![\w\[])\[\[\s[^\n]{0,300}?\s\]\]")),
@@ -328,9 +379,13 @@ def host_is_windows_powershell() -> bool:
     Each PowerShell puts its own user module folder first in PSModulePath and
     child processes inherit it, so this needs no process lookup. The kit
     profile only targets PowerShell 7, so a 5.1 host lacks its UTF-8 setup.
+    A process started outside any PowerShell sees only the machine folders.
     """
-    first = os.environ.get("PSModulePath", "").split(";")[0].rstrip("\\/")
-    return first.lower().endswith(("\\windowspowershell\\modules", "/windowspowershell/modules"))
+    first = os.environ.get("PSModulePath", "").split(";")[0].rstrip("\\/").lower()
+    if not first.endswith(("\\windowspowershell\\modules", "/windowspowershell/modules")):
+        return False
+    machine = (os.environ.get(name, "").rstrip("\\/").lower() for name in ("ProgramW6432", "ProgramFiles", "SystemRoot"))
+    return not any(root and first.startswith(root + "\\") for root in machine)
 
 
 # --------------------------------------------------------------------------
@@ -468,13 +523,11 @@ def detect_syntax(command: str, cfg: dict):
         # parts it can and fail on the rest.
         line_end = masked.find("\n", opener.end())
         cut = len(masked) if line_end < 0 else line_end
-        if not _head_is_powershell(command[:cut], masked[:cut]) and not (
-            unsafe_auto_route().search(command)
-        ):
+        if not _head_is_powershell(command[:cut], masked[:cut]) and not is_unsafe(command):
             return "bash", "heredoc"
     if POWERSHELL_SYNTAX.search(masked):
         return "host", "powershell-syntax"
-    if unsafe_auto_route().search(command):
+    if is_unsafe(command):
         return "host", "unsafe-command"
     if cfg.get("autoRouteBash"):
         for reason, pattern in bash_signatures():
@@ -492,72 +545,70 @@ def detect_syntax(command: str, cfg: dict):
 # Rewrites that stay in the PowerShell host
 # --------------------------------------------------------------------------
 
-def _apply_masked_substitutions(text: str, pattern, replacement) -> str:
-    mask = code_mask(text)
-    edits = []
-    for match in pattern.finditer(mask):
+def _apply_masked_substitutions(text: str, pattern, replacement, mask: str | None = None) -> str:
+    pieces = []
+    last = 0
+    for match in pattern.finditer(code_mask(text) if mask is None else mask):
         start, end = match.span("target")
         value = replacement(match, text[start:end])
         if value is not None:
-            edits.append((start, end, value))
-    for start, end, value in reversed(edits):
-        text = text[:start] + value + text[end:]
-    return text
+            pieces += [text[last:start], value]
+            last = end
+    if not pieces:
+        return text
+    pieces.append(text[last:])
+    return "".join(pieces)
+
+
+def _which_replacement(_match, old: str) -> str:
+    argument = old.split(None, 1)[1]
+    return f"(Get-Command {argument} -ErrorAction SilentlyContinue).Source"
+
+
+def _touch_replacement(_match, old: str):
+    argument = old.split(None, 1)[1]
+    if argument.startswith("-"):
+        return None
+    return f"New-Item -ItemType File -Force -LiteralPath {argument} | Out-Null"
+
+
+def _build_alias_rules():
+    flags = re.I | re.M
+    ends = r"(?=\s*(?:$|[;\n|)}]))"
+    return (
+        ("curl", re.compile(COMMAND_PREFIX + r"(?P<target>curl)(?=\s|$)", flags), lambda _m, _o: "curl.exe"),
+        (
+            "ls",
+            re.compile(COMMAND_PREFIX + r"(?P<target>ls\s+-(?:la|al|lA|Al|aL|La))" + ends, flags),
+            lambda _m, _o: "Get-ChildItem -Force",
+        ),
+        (
+            "which",
+            re.compile(COMMAND_PREFIX + r"(?P<target>which\s+[A-Za-z0-9_.-]+)" + ends, flags),
+            _which_replacement,
+        ),
+        (
+            "touch",
+            re.compile(COMMAND_PREFIX + r"(?P<target>touch\s+[^\s;|&{}()]+)" + ends, flags),
+            _touch_replacement,
+        ),
+        ("cd", re.compile(COMMAND_PREFIX + r"(?P<target>cd\s+/d)(?=\s)", flags), lambda _m, _o: "Set-Location"),
+    )
+
+
+alias_rules = _lazy(_build_alias_rules)
 
 
 def rewrite_safe_aliases(cmd: str) -> str:
     """Rewrite only command-position aliases; never activate destructive rm."""
-    flags = re.I | re.M
-    cmd = _apply_masked_substitutions(
-        cmd,
-        re.compile(COMMAND_PREFIX + r"(?P<target>curl)(?=\s|$)", flags),
-        lambda _match, _old: "curl.exe",
-    )
-    cmd = _apply_masked_substitutions(
-        cmd,
-        re.compile(
-            COMMAND_PREFIX
-            + r"(?P<target>ls\s+-(?:la|al|lA|Al|aL|La))"
-            + r"(?=\s*(?:$|[;\n|)}]))",
-            flags,
-        ),
-        lambda _match, _old: "Get-ChildItem -Force",
-    )
-
-    def which_replacement(_match, old: str) -> str:
-        argument = old.split(None, 1)[1]
-        return f"(Get-Command {argument} -ErrorAction SilentlyContinue).Source"
-
-    cmd = _apply_masked_substitutions(
-        cmd,
-        re.compile(
-            COMMAND_PREFIX
-            + r"(?P<target>which\s+[A-Za-z0-9_.-]+)(?=\s*(?:$|[;\n|)}]))",
-            flags,
-        ),
-        which_replacement,
-    )
-
-    def touch_replacement(_match, old: str):
-        argument = old.split(None, 1)[1]
-        if argument.startswith("-"):
-            return None
-        return f"New-Item -ItemType File -Force -LiteralPath {argument} | Out-Null"
-
-    cmd = _apply_masked_substitutions(
-        cmd,
-        re.compile(
-            COMMAND_PREFIX
-            + r"(?P<target>touch\s+[^\s;|&{}()]+)(?=\s*(?:$|[;\n|)}]))",
-            flags,
-        ),
-        touch_replacement,
-    )
-    cmd = _apply_masked_substitutions(
-        cmd,
-        re.compile(COMMAND_PREFIX + r"(?P<target>cd\s+/d)(?=\s)", flags),
-        lambda _match, _old: "Set-Location",
-    )
+    mask = None
+    for keyword, pattern, replacement in alias_rules():
+        if keyword not in cmd.lower():
+            continue
+        mask = mask or code_mask(cmd)
+        updated = _apply_masked_substitutions(cmd, pattern, replacement, mask)
+        if updated != cmd:
+            cmd, mask = updated, None
     return cmd
 
 
@@ -608,17 +659,20 @@ _STATEMENT = re.compile(r"[;\n]+")
 _SELECT = re.compile(r"\|\s*(?:Select-Object|select)\b(?P<args>[^|]*)", re.I)
 _SELECT_VALUE_PARAMS = {"-first", "-last", "-skip", "-skiplast", "-index"}
 _SELECT_FLAG_PARAMS = {"-unique", "-wait"}
-_PSOBJECT = re.compile(r"\[pscustomobject\]\s*@\{|New-Object\s+(?:-TypeName\s+)?PSObject", re.I)
-# Parsed records print as a table when they have four or fewer properties.
-_RECORD_SOURCE = re.compile(
-    r"(?:^|[\n;|{])[ \t]*(?:ConvertFrom-Json|ConvertFrom-Csv|Import-Csv|Invoke-RestMethod|irm)(?![\w-])",
+# Objects with no format view and four or fewer properties print as such a
+# table. They reach the output in too many ways to follow (`(…).items`,
+# `$j = …; $j`, `Select-Object -First 2`), so any of these sources anywhere
+# in the command gets the guard.
+_OBJECT_SOURCE = re.compile(
+    r"\[pscustomobject\]\s*@\{|New-Object\s+(?:-TypeName\s+)?PSObject|\$PSVersionTable\b"
+    r"|(?<![\w.$/\\-])(?:ConvertFrom-Json|ConvertFrom-Csv|Import-Csv|Invoke-RestMethod|irm"
+    r"|Get-Location|pwd|gl|Get-Member|gm)(?![\w./\\-])",
     re.I,
 )
-_KEEPS_RECORDS = re.compile(r"^\s*(?:(?:Where-Object|where|Sort-Object|sort)\b|\?(?=[\s{]))", re.I)
 _OBJECT_SINK = re.compile(
     r"\|\s*(?:Format-\w+|Out-\w+|Write-\w+|Set-Content|Add-Content|Export-\w+|"
     r"ConvertTo-\w+|Tee-Object|Select-String|Join-String)\b|"
-    r"\|\s*&?\s*\S*\.exe\b|(?<![-<])>",
+    r"\|\s*&?\s*[^\s|]*\.exe\b|(?<![-<])>",
     re.I,
 )
 _SCRIPT_LEVEL = re.compile(r"(?im)^[ \t]*(?:using\s+(?:namespace|module|assembly)\b|param\s*\()")
@@ -655,66 +709,18 @@ def _select_property_count(args: str) -> int:
 def _statement_buffers_table(statement: str) -> bool:
     if _ASSIGNMENT.match(statement) or _OBJECT_SINK.search(statement):
         return False
-    for match in _SELECT.finditer(statement):
-        count = _select_property_count(match.group("args"))
-        if 1 <= count <= 4:
-            return True
-    return bool(_PSOBJECT.search(statement)) or _prints_records(statement)
-
-
-# A block after these runs as statements (`try {`, `if (…) {`, `& {`); one
-# after a command name (`ForEach-Object {`) is an argument.
-_BODY_OPENER = re.compile(r"(?:[)\]]|\b(?:try|catch|finally|else|do)|(?:^|\s)[&.])$", re.I)
-
-
-def _opens_body(out: list[str], start: int) -> bool:
-    # Only the text just before the brace matters; joining the whole prefix
-    # at every brace would make long statements quadratic.
-    return bool(_BODY_OPENER.search("".join(out[max(0, start - 64) : start]).rstrip()))
-
-
-def _statement_parts(statement: str) -> list[str]:
-    """The statement and the block bodies it runs, each with nested groups emptied."""
-    out: list[str] = []
-    openers: list[int] = []
-    parts: list[str] = []
-    for c in statement:
-        if c in "({[":
-            openers.append(len(out))
-        elif c in ")}]" and openers:
-            start = openers.pop()
-            if c == "}" and _opens_body(out, start):
-                parts.append("".join(out[start + 1 :]))
-            del out[start + 1 :]
-        out.append(c)
-    # Statements split at `;` and line breaks, so a block often stays open.
-    bounds = openers + [len(out)]
-    parts.append("".join(out[: bounds[0]]))
-    for start, end in zip(bounds, bounds[1:]):
-        if out[start] == "{" and _opens_body(out, start):
-            parts.append("".join(out[start + 1 : end]))
-    return parts
-
-
-def _prints_records(statement: str) -> bool:
-    # `$j = … | ConvertFrom-Json`, `(… | ConvertFrom-Json).name` and
-    # `… | ConvertFrom-Json | ForEach-Object { … }` print no records.
-    for code in _statement_parts(statement):
-        match = _RECORD_SOURCE.search(code)
-        if not match or _ASSIGNMENT.match(code):
-            continue
-        if all(_KEEPS_RECORDS.match(stage) for stage in code[match.end() :].split("|")[1:]):
-            return True
-    return False
+    return any(1 <= _select_property_count(m.group("args")) <= 4 for m in _SELECT.finditer(statement))
 
 
 def needs_flush_guard(command: str) -> bool:
     """Would PowerShell lose this command's output when the script calls exit?"""
     masked = code_mask(command)
-    if "|" not in masked and not _PSOBJECT.search(masked) and not _RECORD_SOURCE.search(masked):
-        return False
     # `using` and `param` are only legal at the top of a script, not in a block.
     if _SCRIPT_LEVEL.search(masked):
+        return False
+    if _OBJECT_SOURCE.search(masked):
+        return True
+    if "|" not in masked:
         return False
     # A pipe at the end or start of a line continues the pipeline.
     joined = re.sub(r"\|[ \t]*\r?\n[ \t]*", "| ", masked)
@@ -819,6 +825,9 @@ def prepend_utf8(cmd: str, cfg: dict, *, force: bool = False) -> str:
     if not (force or cfg.get("utf8Prefix")):
         return cmd
     if "[Console]::OutputEncoding" in cmd or cmd.lstrip().startswith("$utf8="):
+        return cmd
+    # `using` and `param` must open the script; output encoding matters less.
+    if _SCRIPT_LEVEL.search(cmd):
         return cmd
     return UTF8_PREFIX + cmd
 
