@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import io
 import json
 import os
@@ -1150,7 +1151,7 @@ USER_PROFILE_CODE = "function Get-Mine { 'mine' }\r\n"
 class InstallerTests(unittest.TestCase):
     """install.ps1 -Profile in a throwaway home, under the oldest supported host."""
 
-    def install(self, profile: bytes, settings: dict | None = None):
+    def install(self, profile: bytes, settings: dict | None = None, hooks: dict | None = None, switch="-Profile"):
         home = Path(tempfile.mkdtemp(prefix="aws-install-"))
         self.addCleanup(shutil.rmtree, home, True)
         path = home / "Documents" / "PowerShell" / "Microsoft.PowerShell_profile.ps1"
@@ -1158,6 +1159,9 @@ class InstallerTests(unittest.TestCase):
         path.write_bytes(profile)
         config_path = home / ".agent-windows-shell.json"
         config_path.write_text(json.dumps(settings or {}), encoding="utf-8")
+        if hooks is not None:
+            (home / ".cursor").mkdir()
+            (home / ".cursor" / "hooks.json").write_text(json.dumps(hooks), encoding="utf-8")
         env = dict(
             os.environ,
             USERPROFILE=str(home),
@@ -1167,7 +1171,7 @@ class InstallerTests(unittest.TestCase):
         )
         completed = subprocess.run(
             ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-             "-File", str(ROOT / "install.ps1"), "-Profile"],
+             "-File", str(ROOT / "install.ps1"), switch],
             env=env,
             capture_output=True,
             text=True,
@@ -1192,6 +1196,23 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(path.with_name(path.name + ".agent-windows-shell.bak").read_bytes(), original)
         self.assertNotIn("kitRoot", settings)
         self.assertNotIn("utf8Prefix", settings)
+
+    def test_hook_entry_under_a_short_path_is_replaced(self) -> None:
+        script = ROOT / "src" / "rewrite_windows_shell.py"
+        buffer = ctypes.create_unicode_buffer(1024)
+        ctypes.windll.kernel32.GetShortPathNameW(str(script), buffer, len(buffer))
+        if buffer.value.lower() in ("", str(script).lower()):
+            self.skipTest("this volume has no 8.3 names")
+        stale = {"command": f'& "python" "{buffer.value}"', "matcher": "Shell"}
+        other = {"command": "echo other", "matcher": "Shell"}
+        path, _output, _settings = self.install(
+            b"", hooks={"version": 1, "hooks": {"preToolUse": [stale, other]}}, switch="-Cursor"
+        )
+        entries = json.loads((path.parents[2] / ".cursor" / "hooks.json").read_text(encoding="utf-8"))
+        commands = [entry["command"] for entry in entries["hooks"]["preToolUse"]]
+        self.assertNotIn(stale["command"], commands)
+        self.assertIn(other["command"], commands)
+        self.assertEqual(len(commands), 2, commands)
 
     def test_edited_first_release_block_is_left_alone(self) -> None:
         edited = LEGACY_PROFILE_BLOCK.replace("if ($root) {", "if ($root) {\r\n    Write-Host mine", 1)

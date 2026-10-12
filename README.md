@@ -29,7 +29,7 @@ Set-Location <这个目录>
 
 | 开关 | 作用 |
 |------|------|
-| `-Cursor` | `~\.cursor\hooks.json` + 合并终端相关 settings（只在受管键有变化时才改写；文件里有注释或不是纯 JSON 时不动，只给出提示）；清掉旧版拷进 `~\.cursor\rules` 的规则文件（Cursor 不读那个目录） |
+| `-Cursor` | `~\.cursor\hooks.json`（保留别的 Hook，替换本工具包的旧条目，路径写成 8.3 短路径的也认得出）+ 合并终端相关 settings（只在受管键有变化时才改写；文件里有注释或不是纯 JSON 时不动，只给出提示）；清掉旧版拷进 `~\.cursor\rules` 的规则文件（Cursor 不读那个目录） |
 | `-Claude` | 在 `~\.claude\settings.json` 的 `PreToolUse` 里挂 PowerShell 工具（exec 形式启动 Python），替换本项目旧版写的条目（包括 Git Bash 跑不了的 shell 形式），其他钩子和设置不动；文件不是纯 JSON 时不改，只提示手动合并。并链接技能 |
 | `-Profile` | 在 PowerShell 7 profile（`文档\PowerShell`，跟随 OneDrive 等文档文件夹重定向）写 `# >>> agent-windows-shell` 块，直接点源 `src\profile.ps1`；重装会刷新这个块，块外内容不动，原有的 BOM 保留。第一版安装器写的旧块只有和原样一致时才替换，替换前把原文件存为 `….agent-windows-shell.bak`；旧块被改过时不动，只提示手动删除。profile 不是 UTF-8 编码（包括没有 BOM 的 UTF-16）时不改，只提示 |
 | `-Skill` | 用 junction 把 `skills\windows-agent-shell` 链到 `~\.cursor\skills`，仓库更新即生效；不写 `~\.agents` |

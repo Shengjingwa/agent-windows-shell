@@ -84,6 +84,23 @@ function Set-ObjectProperty {
     $Object | Add-Member -NotePropertyName $Name -NotePropertyValue $Value -Force
 }
 
+function Test-RunsScript {
+    param([string]$Command, [Parameter(Mandatory = $true)][string]$ScriptPath)
+    if (-not $Command) { return $false }
+    if ($Command.IndexOf($ScriptPath, [StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true }
+    # The same file under an 8.3 short path (C:\Users\ADMINI~1\...\REWRIT~1.PY).
+    $target = [IO.Path]::GetFullPath($ScriptPath)
+    foreach ($match in [regex]::Matches($Command, '"([^"]+)"')) {
+        try {
+            $path = $match.Groups[1].Value
+            if ((Test-Path -LiteralPath $path -PathType Leaf) -and [IO.Path]::GetFullPath($path) -eq $target) {
+                return $true
+            }
+        } catch { }
+    }
+    return $false
+}
+
 function Merge-ManagedHook {
     param(
         [Parameter(Mandatory = $true)]$Hooks,
@@ -95,8 +112,7 @@ function Merge-ManagedHook {
     $property = $Hooks.PSObject.Properties[$Event]
     if ($property) {
         foreach ($item in @($property.Value)) {
-            if (-not ($item.command -and
-                    ([string]$item.command).IndexOf($ScriptPath, [StringComparison]::OrdinalIgnoreCase) -ge 0)) {
+            if (-not (Test-RunsScript -Command ([string]$item.command) -ScriptPath $ScriptPath)) {
                 [void]$merged.Add($item)
             }
         }
